@@ -64,6 +64,8 @@ void infer_pixel_to_rgb(const uint8_t *p, infer_pixfmt_t fmt,
     }
 }
 
+/* letterbox：按长边等比缩放再居中补边，保证检测框能原样反算回原图；
+ * 缩放比与补边偏移必须与后处理共用同一组参数，否则框会整体偏移。 */
 infer_lb_t infer_letterbox_param(int src_w, int src_h, int dst_w, int dst_h) {
     infer_lb_t lb;
     lb.src_w = src_w; lb.src_h = src_h;

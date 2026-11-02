@@ -63,6 +63,9 @@ static int ped_is_near(const pp_box_t *b, const dec_cfg_t *cfg) {
            (ybot_ratio >= cfg->ped_zone_y_ratio);
 }
 
+/* 决策：优先采用 FPGA 侧给出的灯色/车道/运动量（ext）；
+ * 只有这些量未知时才退化成按检出框计数判断，这样 ARM 侧偶发漏检
+ * 也不会让决策立刻失效。 */
 int dec_run(const pp_box_t *boxes, int n_boxes,
             const dec_input_ext_t *ext,
             const dec_cfg_t *cfg,

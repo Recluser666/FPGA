@@ -19,6 +19,8 @@ _Static_assert((int)INFER_PIX_GRAY8  == (int)FRAME_PIX_GRAY8  &&
                (int)INFER_PIX_BGR888 == (int)FRAME_PIX_BGR888,
                "infer_pixfmt_t 与 frame_pixfmt_t 必须一致");
 
+/* 三段流水：取帧 / 预处理+推理 / 显示 各跑一个线程，用环形槽位传递
+ * 帧下标而不是拷贝像素，整帧数据自始至终只搬一次，省下的是等待而非算力。 */
 #define PRE_RING 3
 
 typedef struct {
@@ -58,6 +60,7 @@ typedef struct {
     double t_sum; int n_renders; double t_max;
 } disp_stage_t;
 
+/* 显示环独立于推理环：显示慢一帧时只丢最旧的显示帧，不阻塞推理。 */
 static int dsp_reserve(disp_stage_t *s) {
     pthread_mutex_lock(&s->mtx);
     while (s->state[s->p_idx] != 0 && !s->stop)
@@ -116,6 +119,7 @@ static void *dsp_thread(void *arg) {
     }
 }
 
+/* 取一个空闲槽位：这里只返回下标，像素仍留在原缓冲区，避免整帧 memcpy。 */
 static int pre_stage_reserve(pre_stage_t *s) {
     pthread_mutex_lock(&s->mtx);
     while (s->count >= PRE_RING && !s->stop)

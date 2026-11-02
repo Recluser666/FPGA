@@ -259,6 +259,8 @@ arm_transport_t *arm_transport_raw_new(const char *path, int w, int h, frame_pix
 
 #define DMA_BAR_CMD_ADDR    0x110u
 #define DMA_BAR_CLEAR_ADDR  0x130u
+/* footer 的两种字节序：多数版本按小端写，个别版本每 DW 内部字节倒序，
+ * 这里都接受，读入后统一归一化，上层不必再关心字节序。 */
 #define DMA_FOOTER_MAGIC    0x53414441u
 #define DMA_FOOTER_MAGIC_SWAP 0x41444153u
 #define DMA_FOOTER_LEN      64u
@@ -488,6 +490,8 @@ static void dma_copy_pixels(uint8_t *dst, const uint8_t *src, size_t n, int swap
         return;
     }
 
+    /* FPGA 写 DDR 时 16 字节组内的像素顺序是 6 5 4 3 2 1 0 7，不是纯倒序；
+     * 实测比对该排列后按此还原，否则画面会被切成 8 像素一块。 */
     if (swap_mode == 4) {
         for (; i + 16 <= n; i += 16) {
             const uint8_t *sp = src + i;
@@ -762,6 +766,8 @@ static void dma_pick_buffers(dma_priv_t *p)
     }
 
     for (i = 0; i < p->nbufs; i++) {
+        /* buf0 的物理地址 0x2000000 落在内核保留区，FPGA 往那里写会直接打崩内核，
+         * 所以自动把它从下发列表里剔除，只用剩余可用块。 */
         if (phys_unsafe(p->dma_addr[i], p->bufsize)) {
             fprintf(stderr,
                     "[dma] ⚠️ buf[%u] 物理地址 0x%08llx 落在内核/保留区，已自动跳过\n"

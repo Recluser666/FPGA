@@ -86,6 +86,8 @@ int infer_init(const infer_cfg_t *cfg) {
     fprintf(stderr, "[infer] 未编译 RKNN 支持（缺 -DHAVE_RKNN），仅纯 C 路径可用\n");
     return -2;
 #else
+    /* 量化模型的输出是 int8，必须记住每路输出的 scale/zp 才能还原成浮点，
+     * 后面解码检测头时用的就是这里取到的值。 */
     int ret = rknn_init(&g_ctx, (void *)g_cfg.model_path, 0, 0, NULL);
     if (ret < 0) { fprintf(stderr, "[infer] rknn_init 失败 %d\n", ret); infer_release(); return -3; }
 

@@ -61,6 +61,8 @@ int pp_letterbox(const unsigned char *src, int src_w, int src_h,
 }
 
 
+/* 反 letterbox：先把归一化坐标还原到 1120×640 的输入尺度，
+ * 再减去补边、除以缩放比，回到原始画面坐标。 */
 static int map_back_px(float cx, float cy, float bw, float bh,
                        const pp_lb_t *lb, float *x1, float *y1,
                        float *x2, float *y2) {
@@ -186,6 +188,8 @@ int pp_decode_std(const pp_head_t *heads, int n_heads,
 }
 
 
+/* 逐类别 NMS：先按置信度降序，再两两算 IoU，超过阈值的低分框丢弃，
+ * 同一目标只保留一个框；排序用插入排序，框数少时比快排更省。 */
 int pp_nms(pp_box_t *boxes, int n, float iou_thres, int agnostic,
            pp_box_t *out, int max_out) {
     if (!boxes || n <= 0 || !out || max_out <= 0) return 0;

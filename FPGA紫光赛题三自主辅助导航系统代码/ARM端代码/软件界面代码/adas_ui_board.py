@@ -9,6 +9,7 @@ if not os.path.exists(FF):
 FONT_B = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
 FONT_R = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 
+# 版面四区：顶栏 / 左侧视频区 / 右侧识别面板 / 底栏，像素高度固定，改版式只动这四个常量
 CW, CH = 1920, 1080
 TOPB, PANW, BOTB = 64, 320, 116
 VW, VH = CW-PANW, CH-TOPB-BOTB
@@ -190,9 +191,11 @@ def main():
     DW, DH = meta['w'], meta['h']
     FRAMES = meta['frames']
 
+    # 静态版面一次性转成"内存里就是 BGRA"的 RGBA 图，省掉每帧 img.convert('RGBA')（实测 18ms）
     BG = build_bg()
     F = make_fields(BG)
 
+        # 缩放与像素格式全部交给 ffmpeg（C/NEON），板端比 PIL 快一个数量级
     def decode():
         cmd = [FF, '-v', 'quiet', '-i', a.video,
                '-vf', 'scale=%d:%d:flags=bilinear' % (VW, VH),
@@ -265,6 +268,7 @@ def main():
             F['per'].paint(mm, npp, draw_counts('person', npp, 0))
             F['lights'].paint(mm, (nr, ng), draw_lights(nr, ng))
             F['dec'].paint(mm, dec, draw_decision(dec))
+                        # 数值没变就连 fb 都不写；只有帧率/延迟/帧号每帧必刷
             F['fps'].paint(mm, "%.1f" % fps, draw_text("%.1f fps" % fps))
             F['ms'].paint(mm, "%.1f" % ema, draw_text("%.1f ms" % ema))
             F['nfr'].paint(mm, idx, draw_text(

@@ -125,6 +125,8 @@ static void init_tabs(void) {
     done = 1;
 }
 
+/* RGB565 展开成 32bpp：r5/g6/b5 各自查表放大到 8 位，避免逐像素移位，
+ * 展开结果直接按帧缓冲的行宽写出。 */
 static void conv_row(const uint8_t *restrict s, uint32_t *restrict d, int n, int bgr) {
     if (bgr) {
         for (int x = 0; x < n; ++x) {
@@ -265,6 +267,8 @@ display_t *display_open(const char *path, int src_w, int src_h) {
 
     struct fb_var_screeninfo vi;
     struct fb_fix_screeninfo fi;
+    /* 行跨距取 fb 自己报的 line_length，而不是 width*4：
+     * 有些驱动会做行对齐，用 width*4 画出来的图会斜。 */
     if (ioctl(d->fd, FBIOGET_VSCREENINFO, &vi) == 0 &&
         ioctl(d->fd, FBIOGET_FSCREENINFO, &fi) == 0) {
         d->is_real_fb = 1;
