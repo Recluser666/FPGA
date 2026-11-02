@@ -1,0 +1,200 @@
+
+//=============================================================================
+// module cam_line_rd  --  摄像头帧读取 + 水平 Bresenham（2026-10-31 双路版）
+//
+//   本版相对上一版的两处改动（因为写侧改成了双路交织）：
+//     1) 纵向不再是 720->1080 的 Bresenham，而是【两段 1:1 直取】：
+//          上部 y=0..SEG_H-1   -> 物理行 2*y            （cam1）
+//          下部 y=SEG_H..2*SEG_H-1 -> 物理行 2*(y-SEG_H)+1 （cam2）
+//        为什么能 1:1：写侧已经把 720 行抽成 540 行并按段排好，
+//        所以"一个显示行 = 一个源行"，纵向零缩放、零累加器，最不容易错。
+//     2) 行号直接由 rd_y 算，不再靠"行起点自增累加器"（上电/丢行都不会错位）
+//
+//   保持不变的部分（上一版已上板验证）：
+//     · 水平 Bresenham 640 -> 960（每 3 个显示像素取 2 个源像素）
+//     · 只在行号真的变化时才发一次 40 拍 DDR 读；行缓存按 (行号 mod 8) 分槽
+//     · 流水 3 级：行缓存读延迟 1 拍 + 半字选择 2 拍 + 输出寄存器 1 拍
+//       （★ 半字选择必须和读延迟同级对齐，否则每组 3 像素变成 [a,b,a]）
+//     · vout_de 直接由当拍的 rd_de/rd_x 判定，不用延时链
+//
+//   像素位序（与厂商 rd_buf.v 的 PIX_WIDTH==16 分支一致，别改）：
+//     32bit 字 a 里，源像素 2a 在 [31:16]、源像素 2a+1 在 [15:0]
+//=============================================================================
+module cam_line_rd #(
+    parameter integer SRC_W  = 640,     // 源行宽（= 写侧 2:1 平均后的宽度）
+    parameter integer SEG_H  = 540,     // 每段显示行数（上下各 540，共 1080）
+    parameter integer DST_X0 = 960,     // 右半屏起点
+    parameter integer DST_W  = 960      // 右半屏宽
+)(
+    input  wire         vout_clk,
+    input  wire         ddr_clk,
+    input  wire         rst_n,
+    input  wire         rd_fsync,      // 帧头（vout_clk 域）
+    input  wire         rd_de,         // 显示 DE（与 rd_x/rd_y 对齐）
+    input  wire [11:0]  rd_x,
+    input  wire [11:0]  rd_y,          // ★ 本版新增：显示行号
+    input  wire         frame_bank,    // 读哪一块 DDR3 帧缓存（ddr_clk 域稳定电平）
+    input  wire [27:0]  base_addr,
+    output reg          ddr_rreq,
+    output wire [27:0]  ddr_raddr,
+    output wire [31:0]  ddr_rd_len,
+    input  wire         ddr_rdone,
+    input  wire         ddr_rdata_en,
+    input  wire [255:0] ddr_rdata,
+    output wire [15:0]  vout_data,
+    output wire         vout_de
+);
+
+    localparam integer BEATS  = SRC_W*16/256;       // 每行 256bit 拍数（640 -> 40）
+    localparam integer STRIDE = SRC_W/2;            // 每行 32bit 字数（必须等于 wr_buf 的 DDR_ADDR_OFFSET）
+    localparam [11:0]  SW     = SRC_W;
+    localparam [11:0]  SEGW   = SEG_H;
+    localparam [11:0]  GEN0   = DST_X0 - 3;         // 957：提前 3 拍
+    localparam [11:0]  GEN1   = DST_X0 + DST_W - 1; // 1919：多跑 3 拍排空流水
+    localparam [11:0]  X0     = DST_X0;
+    localparam [11:0]  X1     = DST_X0 + DST_W - 1;
+    localparam [31:0]  RD_LEN = BEATS;
+
+    //=====================================================================
+    // 一、vout_clk 域：源行号（两段 1:1）+ 水平 Bresenham + 像素流水
+    //=====================================================================
+    reg  [11:0] buf_row;       // 行缓存里现在是物理第几行（12'hFFF = 空）
+    reg         req_tgl;       // 读请求翻转（跨到 ddr_clk 域）
+    reg  [11:0] req_row;       // 请求的物理行号
+
+    reg  [11:0] sx;            // 水平：当前取源第几列
+    reg  [12:0] acc_h;
+    reg  [11:0] rd_word;       // 行缓存读地址（32bit 字）
+    reg  [11:0] sx_d1, sx_d2;  // 源列号打两拍（与读延迟 + 输出寄存对齐）
+    reg  [15:0] pix_r;
+
+    wire [31:0] lb_word;
+    wire        seg      = (rd_y >= SEGW);                      // 0=上段(cam1) 1=下段(cam2)
+    wire [11:0] yin      = seg ? (rd_y - SEGW) : rd_y;          // 段内行号
+    wire [11:0] want_row = {yin[10:0], 1'b0} + {11'd0, seg};    // 物理行 = 2*yin + seg
+
+    wire line_start = rd_de && (rd_x == 12'd0);
+    wire gen        = rd_de && (rd_x >= GEN0) && (rd_x <= GEN1);
+
+    // 水平：acc_h + SRC_W 跨过 DST_W 就在下一像素取源下一列（640->960，每 3 取 2）
+    wire [12:0] acc_h_n  = acc_h + SRC_W;
+    wire        adv_h    = (acc_h_n >= DST_W);
+    wire [11:0] slot_word = {buf_row[2:0], 9'd0};               // 行槽基址
+    wire [11:0] word_addr = slot_word + {2'b0, sx[10:1]};       // + 列字偏移
+
+    always @(posedge vout_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            buf_row <= 12'hFFF;
+            req_tgl <= 1'b0;
+            req_row <= 12'd0;
+            sx      <= 12'd0;
+            acc_h   <= 13'd0;
+            rd_word <= 12'd0;
+            sx_d1   <= 12'd0;
+            sx_d2   <= 12'd0;
+            pix_r   <= 16'd0;
+        end else begin
+            //---------- 像素流水：每一拍都移（不能在 gen 里才移，否则行尾冻结）----------
+            pix_r <= sx_d2[0] ? lb_word[15:0] : lb_word[31:16];
+
+            //---------- 帧头：强制重取 -----------
+            if (rd_fsync) buf_row <= 12'hFFF;
+
+            //---------- 行起点：算本显示行要哪一物理行，变了才读一次 DDR -----------
+            if (line_start) begin
+                sx    <= 12'd0;
+                acc_h <= 13'd0;
+                if (want_row != buf_row) begin
+                    req_row <= want_row;
+                    req_tgl <= ~req_tgl;
+                    buf_row <= want_row;
+                end
+            end
+
+            //---------- 右半屏：地址/计数推进 -----------
+            if (gen) begin
+                rd_word <= word_addr;
+                sx_d1   <= sx;
+                sx_d2   <= sx_d1;
+                // 最后一列钳住（gen 比窗口多跑 3 拍，为了排空流水）
+                if (sx < SW - 12'd1) begin
+                    if (adv_h) begin
+                        sx    <= sx + 12'd1;
+                        acc_h <= acc_h_n - DST_W;
+                    end else begin
+                        acc_h <= acc_h_n;
+                    end
+                end
+            end
+        end
+    end
+
+    //=====================================================================
+    // 二、ddr_clk 域：请求跨域 + 发读事务 + 行缓存填充
+    //=====================================================================
+    reg         req_s, req_s1;
+    reg         pend;
+    reg  [11:0] pend_row;
+    reg         busy;
+    reg  [11:0] row_d;
+    reg  [8:0]  fill_addr;
+
+    wire req_pulse = (req_s ^ req_s1);
+
+    always @(posedge ddr_clk or negedge rst_n) begin
+        if (!rst_n) begin req_s <= 1'b0; req_s1 <= 1'b0; end
+        else        begin req_s <= req_tgl; req_s1 <= req_s; end
+    end
+
+    always @(posedge ddr_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ddr_rreq  <= 1'b0;
+            pend      <= 1'b0;
+            pend_row  <= 12'd0;
+            busy      <= 1'b0;
+            row_d     <= 12'd0;
+            fill_addr <= 9'd0;
+        end else begin
+            ddr_rreq <= 1'b0;                 // 1 拍请求，靠仲裁器的 rpend 挂起
+            if (pend && !busy) begin
+                busy      <= 1'b1;
+                ddr_rreq  <= 1'b1;
+                row_d     <= pend_row;
+                fill_addr <= {pend_row[2:0], 6'd0};
+                pend      <= 1'b0;
+            end else if (ddr_rdone) begin
+                busy <= 1'b0;
+            end
+            if (req_pulse) begin
+                pend     <= 1'b1;
+                pend_row <= req_row;
+            end
+            if (ddr_rdata_en) fill_addr <= fill_addr + 9'd1;
+        end
+    end
+
+    wire [27:0] row_off  = row_d * STRIDE;
+    wire [27:0] bank_off = {1'b0, frame_bank, 21'd0};
+    assign ddr_raddr  = base_addr + bank_off + row_off;
+    assign ddr_rd_len = RD_LEN;
+
+    //=====================================================================
+    // 三、行缓存（256bit 写 / 32bit 读，双时钟）
+    //=====================================================================
+    rd_fram_buf u_row_buf (
+        .wr_data  (ddr_rdata    ),
+        .wr_addr  (fill_addr    ),
+        .wr_en    (ddr_rdata_en ),
+        .wr_clk   (ddr_clk      ),
+        .wr_rst   (~rst_n       ),
+        .rd_addr  (rd_word      ),
+        .rd_data  (lb_word      ),
+        .rd_clk   (vout_clk     ),
+        .rd_rst   (~rst_n       )
+    );
+
+    assign vout_data = pix_r;
+    // de 由当拍 rd_de/rd_x 判定：流水已把 pix_r 对齐到"时钟 = 显示 x"
+    assign vout_de   = rd_de && (rd_x >= X0) && (rd_x <= X1);
+
+endmodule

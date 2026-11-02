@@ -1,0 +1,311 @@
+//=============================================================================
+// module cam_fe  --  单摄像头前端：2:1 平均 + 行缓存 + 垂直抽行（2026-10-31）
+//
+//   写侧（c_clk = 摄像头自己的像素时钟）：
+//     · 水平 2:1 平均：相邻两像素按 RGB565 分通道求平均（+1 四舍五入）
+//       1280 -> 640，与 1944 mosaic_wr 的取法一致
+//     · 垂直抽行：每 DIV 行保留 KEEP 行（720 -> 540），判定在【行起点】做，
+//       丢掉的行不发布（写进同一个 bank，被下一保留行覆盖，读侧永远看不到）
+//       ★ 为什么在写侧抽：两路上下各占 540 行，读侧就变成 1:1 直取，
+//         不用做纵向缩放，行号与显示行号一一对应 —— 这是最不容易错的划分
+//     · 4 个 bank 轮转（每发布一行翻一个），给跨时钟域留 3 行余量
+//
+//   读侧（r_clk = 消费方时钟）：bank/addr 由消费方给，只读不写，寄存输出
+//
+//   ★ 跨时钟域只在这里：cam2 用 (写 cam2_pclk_16bit / 读 cam_pclk_16bit) 的双时钟
+//     BRAM，只把"发布翻转"这一个比特跨过去；bank 号由消费方按自己的消费计数算
+//     （两侧都从 0 开始、每次发布翻一个 bank，所以必然一致，不需要跨域传多比特）
+//=============================================================================
+module cam_fe #(
+    parameter integer H_NUM = 640,     // 每行输出像素（2:1 平均后）
+    parameter integer DIV   = 4,       // 垂直抽行分母
+    parameter integer KEEP  = 3        // 每 DIV 行保留 KEEP 行
+)(
+    input  wire        c_clk,
+    input  wire        rst_n,
+    input  wire        vs,             // 该摄像头 VSYNC（高有效）
+    input  wire        de,             // 该摄像头行有效：1 像素/拍
+    input  wire [15:0] pix,            // RGB565
+    input  wire        r_clk,          // 读时钟（消费方）
+    input  wire [1:0]  r_bank,         // 读哪个 bank（消费方给）
+    input  wire [9:0]  r_addr,         // 读地址 0..H_NUM-1
+    output reg  [15:0] r_pix,          // 读数据（r_clk 域，寄存输出）
+    output reg         pub_tgl,        // c_clk 域：每发布一行翻转一次
+    output reg  [11:0] src_lines       // 上一帧源行数（帧末锁存，诊断用）
+);
+    // 4 bank x 1024（bank 步长用 1024，索引直接 {wbank,waddr}，不用乘法）
+    reg [15:0] mem [0:4095];
+
+    reg [1:0]  wbank;
+    reg [9:0]  waddr;
+    reg        pair;
+    reg [15:0] p0;
+    reg        de_d;
+    reg [11:0] ln;            // 帧内源行号
+    reg        keep;          // 本行是否保留
+
+    // 2:1 平均（RGB565 分通道，+1 四舍五入）
+    wire [5:0]  ar = ({1'b0, p0[15:11]} + {1'b0, pix[15:11]} + 6'd1) >> 1;
+    wire [6:0]  ag = ({1'b0, p0[10:5] } + {1'b0, pix[10:5] } + 7'd1) >> 1;
+    wire [5:0]  ab = ({1'b0, p0[4:0]  } + {1'b0, pix[4:0]  } + 6'd1) >> 1;
+    wire [15:0] avg = {ar[4:0], ag[5:0], ab[4:0]};
+
+    // 读口（独立时钟，寄存输出 -> 推断双端口 BRAM）
+    always @(posedge r_clk) r_pix <= mem[{r_bank, r_addr}];
+
+    // VSYNC 上升沿（本域同步）
+    reg [2:0] vs_s;
+    always @(posedge c_clk or negedge rst_n) begin
+        if (!rst_n) vs_s <= 3'd0;
+        else        vs_s <= {vs_s[1:0], vs};
+    end
+    wire vs_rise = (vs_s[2:1] == 2'b01);
+
+    always @(posedge c_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wbank     <= 2'd0;
+            waddr     <= 10'd0;
+            pair      <= 1'b0;
+            p0        <= 16'd0;
+            de_d      <= 1'b0;
+            ln        <= 12'd0;
+            keep      <= 1'b0;
+            pub_tgl   <= 1'b0;
+            src_lines <= 12'd0;
+        end else begin
+            de_d <= de;
+
+            //---------------- 行内：2:1 平均写入当前 bank ----------------
+            if (!de) begin
+                pair  <= 1'b0;
+                waddr <= 10'd0;
+            end else begin
+                pair <= ~pair;
+                if (!pair) begin
+                    p0 <= pix;                              // 偶数拍：锁存第一个
+                end else if (waddr < H_NUM) begin
+                    mem[{wbank, waddr}] <= avg;             // 奇数拍：写平均值
+                    waddr <= waddr + 10'd1;
+                end
+            end
+
+            //---------------- 行起点：判定本行是否保留 ----------------
+            //   ln 在行末才自增，所以这里读到的就是"本行"的源行号
+            if (de && !de_d)
+                keep <= (ln[1:0] < KEEP[1:0]);
+
+            //---------------- 行末：保留则发布（翻 bank + 翻翻转） ----------------
+            if (de_d && !de) begin
+                if (keep) begin
+                    wbank   <= wbank + 2'd1;
+                    pub_tgl <= ~pub_tgl;
+                end
+                if (ln != 12'd4095) ln <= ln + 12'd1;
+            end
+
+            //---------------- 帧末：源行数锁存，行号归零 ----------------
+            if (vs_rise) begin
+                src_lines <= ln;
+                ln        <= 12'd0;
+                waddr     <= 10'd0;
+            end
+        end
+    end
+
+endmodule
+
+//=============================================================================
+// module cam_dual_wr  --  双摄像头合成写发生器（2026-10-31）
+//
+//   目标：右半屏 960x1080 拆成【上 540 = cam1】【下 540 = cam2】。
+//
+//   做法（关键，别改）：
+//     · 两颗摄像头各走自己的时钟域做 2:1 平均 + 纵向抽行（cam_fe），
+//       各自把 540 行放进 4 bank 行缓存
+//     · 本模块在【cam1 的时钟域】里把两路逐行交织：cam1 第 k 行、cam2 第 k 行、
+//       cam1 第 k+1 行 …… 一帧共 2*SEG_V = 1080 行，顺序写进同一个 wr_buf
+//     · 于是帧缓存里的物理行号 = 2*k + seg（seg=0 上行=cam1，seg=1 下行=cam2）
+//       ★ 这样仍然只有【一个摄像头写口】，DDR 仲裁器、显示通路一行都不用改
+//     · 读侧（cam_line_rd）因此不需要纵向缩放：显示行 -> 物理行是一次乘 2 加偏移
+//
+//   时序余量：输出一行 640 拍 @42MHz ≈ 15us，摄像头行周期约 44us，
+//             每来一行要输出两行（30us）-> 占空比约 70%，够用
+//=============================================================================
+module cam_dual_wr #(
+    parameter integer H_NUM  = 640,    // 每行输出像素（2:1 平均后）
+    parameter integer SEG_V  = 540     // 每颗摄像头每段占的显示行数
+)(
+    input  wire        clk,          // cam1 像素时钟 cam_pclk_16bit
+    input  wire        rst_n,
+    input  wire        vs1,
+    input  wire        de1,
+    input  wire [15:0] pix1,
+    input  wire        clk2,         // cam2 像素时钟 cam2_pclk_16bit
+    input  wire        vs2,
+    input  wire        de2,
+    input  wire [15:0] pix2,
+    output reg         o_fsync,      // 一帧写完才发（VSYNC 上升沿）
+    output reg         o_en,
+    output reg  [15:0] o_px,
+    output reg  [11:0] o_rows,       // 本帧已输出行数（0..2*SEG_V）
+    output reg  [11:0] o_lines       // cam1 上一帧源行数（诊断）
+);
+
+    //=====================================================================
+    // 一、两路前端
+    //=====================================================================
+    wire [15:0] fe1_pix, fe2_pix;
+    wire        fe1_tgl, fe2_tgl;
+    wire [11:0] fe1_lines, fe2_lines;
+    reg  [1:0]  rd_bank1, rd_bank2;
+    reg  [9:0]  rd_addr1, rd_addr2;
+
+    cam_fe #(.H_NUM(H_NUM)) u_fe1 (
+        .c_clk     (clk),          // 写读同域
+        .rst_n     (rst_n),
+        .vs        (vs1),
+        .de        (de1),
+        .pix       (pix1),
+        .r_clk     (clk),
+        .r_bank    (rd_bank1),
+        .r_addr    (rd_addr1),
+        .r_pix     (fe1_pix),
+        .pub_tgl   (fe1_tgl),
+        .src_lines (fe1_lines)
+    );
+
+    cam_fe #(.H_NUM(H_NUM)) u_fe2 (
+        .c_clk     (clk2),         // ★ 跨时钟域：写 cam2 域、读 cam1 域
+        .rst_n     (rst_n),
+        .vs        (vs2),
+        .de        (de2),
+        .pix       (pix2),
+        .r_clk     (clk),
+        .r_bank    (rd_bank2),
+        .r_addr    (rd_addr2),
+        .r_pix     (fe2_pix),
+        .pub_tgl   (fe2_tgl),
+        .src_lines (fe2_lines)
+    );
+
+    // cam2 的发布翻转打两拍到本域（只跨这一个比特）
+    reg [2:0] fe2_tgl_s;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) fe2_tgl_s <= 3'd0;
+        else        fe2_tgl_s <= {fe2_tgl_s[1:0], fe2_tgl};
+    end
+    wire fe2_tgl_d = fe2_tgl_s[2];
+
+    //=====================================================================
+    // 二、交织输出状态机（本域）
+    //   bank = 消费计数 & 3：两侧都从 0 开始、每次发布翻一个 bank，必然一致
+    //=====================================================================
+    localparam [1:0] M_W1   = 2'd0,   // 等 cam1 第 k 行
+                     M_PRE1 = 2'd1,   // 预取第 0 个像素
+                     M_O1   = 2'd2,   // 输出 cam1 第 k 行
+                     M_W2   = 2'd3;   // 等 cam2 第 k 行 + 输出
+
+    reg [1:0]  st;
+    reg [1:0]  n1, n2;            // 已消费的发布数（& 3 = bank）
+    reg        seen1, seen2;
+    reg [9:0]  xa;                // 行内像素计数
+
+    // VSYNC1 上升沿（本域）
+    reg [2:0] vs1_s;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) vs1_s <= 3'd0;
+        else        vs1_s <= {vs1_s[1:0], vs1};
+    end
+    wire vs1_rise = (vs1_s[2:1] == 2'b01);
+
+    // cam2 段的状态（M_W2 内部两步：先等、再预取、再输出）
+    reg        w2_pre;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            st      <= M_W1;
+            n1      <= 2'd0;
+            n2      <= 2'd0;
+            seen1   <= 1'b0;
+            seen2   <= 1'b0;
+            xa      <= 10'd0;
+            w2_pre  <= 1'b0;
+            rd_bank1<= 2'd0;
+            rd_bank2<= 2'd0;
+            rd_addr1<= 10'd0;
+            rd_addr2<= 10'd0;
+            o_en    <= 1'b0;
+            o_px    <= 16'd0;
+            o_fsync <= 1'b0;
+            o_rows  <= 12'd0;
+            o_lines <= 12'd0;
+        end else begin
+            o_en    <= 1'b0;
+            o_fsync <= vs1_rise;              // 只在 VSYNC 上升沿 = 一帧写完
+
+            if (vs1_rise) begin
+                o_lines <= fe1_lines;
+                o_rows  <= 12'd0;
+            end
+
+            case (st)
+            //--------- 等 cam1 第 k 行发布 ---------
+            M_W1: begin
+                if (fe1_tgl != seen1) begin
+                    seen1   <= fe1_tgl;
+                    rd_bank1<= n1;             // bank = 消费计数 & 3
+                    rd_addr1<= 10'd0;
+                    xa      <= 10'd0;
+                    st      <= M_PRE1;
+                end
+            end
+            //--------- 预取第 0 个像素（行缓存读延迟 1 拍） ---------
+            M_PRE1: begin
+                st <= M_O1;
+            end
+            //--------- 输出 cam1 第 k 行 ---------
+            M_O1: begin
+                o_en <= 1'b1;
+                o_px <= fe1_pix;
+                if (xa == H_NUM-1) begin
+                    n1     <= n1 + 2'd1;
+                    seen2  <= fe2_tgl_d;       // 进 M_W2 前把 cam2 旧翻转吃掉
+                    w2_pre <= 1'b0;
+                    st     <= M_W2;
+                    o_rows <= o_rows + 12'd1;
+                end else begin
+                    xa      <= xa + 10'd1;
+                    rd_addr1<= xa + 10'd1;
+                end
+            end
+            //--------- 等 cam2 第 k 行发布，再输出 ---------
+            M_W2: begin
+                if (!w2_pre) begin
+                    if (fe2_tgl_d != seen2) begin
+                        seen2    <= fe2_tgl_d;
+                        rd_bank2 <= n2;
+                        rd_addr2 <= 10'd0;
+                        xa       <= 10'd0;
+                        w2_pre   <= 1'b1;
+                    end
+                end else begin
+                    // 输出 cam2 第 k 行（与 cam1 同样的 640 拍）
+                    o_en <= 1'b1;
+                    o_px <= fe2_pix;
+                    if (xa == H_NUM-1) begin
+                        n2     <= n2 + 2'd1;
+                        w2_pre <= 1'b0;
+                        o_rows <= o_rows + 12'd1;
+                        st     <= M_W1;
+                    end else begin
+                        xa       <= xa + 10'd1;
+                        rd_addr2 <= xa + 10'd1;
+                    end
+                end
+            end
+            default: st <= M_W1;
+            endcase
+        end
+    end
+
+endmodule

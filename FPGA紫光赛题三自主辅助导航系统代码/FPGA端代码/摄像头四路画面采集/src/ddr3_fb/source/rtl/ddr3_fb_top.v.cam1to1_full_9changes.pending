@@ -1,0 +1,5036 @@
+//=============================================================================
+// ddr3_fb_top.v -- DDR3 帧缓存子系统集成顶层（自研）
+//
+// 用途：DDR3 数据通路的**自检工程**。不接摄像头、不接 HDMI，自己产生
+//       「可预测的图样」写进 DDR3，再读回来**逐像素比对**，用 LED 报告结果。
+//
+// 为什么要有这个工程（而不是直接接 video_in）：
+//   1) 先独立证明「写 DDR3 → 读 DDR3」这条链路是对的；
+//   2) 后面接 video_in 时，如果画面不对，就能立刻判断是 DDR3 的问题还是采集的问题；
+//   3) DDR3 引脚/PHY 是最容易出错、也最难查的部分，值得单独验证。
+//
+// 数据流：
+//   写侧  sync_vg(10MHz cfg_clk) ──图样生成──► fram_buf.wr_* ──► DDR3
+//   读侧  sync_vg(74.25MHz pix_clk) ──时序──► fram_buf.rd_* ──► vout_data
+//                                                    │
+//                                                    └──► 与写侧图样逐像素比对
+//
+// 图样为什么能被比对：
+//   写侧图样是**纯函数** pixel(行号, 列号)，读侧用同样公式**算一遍期望值**再与
+//   读回的数据比。不存第二份图样，省 BRAM，而且天然对齐。
+//
+// 图样函数（16bit，与 RGB565 位域无关，纯粹是为了让每一位都翻转）：
+//     行 i、列 j 处：  pixel = {i[3:0], j[7:0], i[7:4]}
+//   即低 8 位随列号走、高 4 位与次低 4 位随行号走 —— 行列都动，能抓出
+//   地址计算错误、行错位、字节序错误。
+//   ⚠️ 写侧与读侧**必须用同一个函数**，这是比对能成立的前提。
+//
+// LED 判据（4 颗）：
+//   led[0]  ddr_init_done   DDR3 初始化完成（PHY 校准通过）
+//   led[1]  fb_init_done    fram_buf 就绪
+//   led[2]  读侧有活动       (de/rd 在动，约每秒翻转一次，肉眼可见闪烁)
+//   led[3]  校验通过        收到过完整帧 且 一个坏帧都没有
+//
+// 本工程**不做**的事：
+//   · 不接摄像头（cmos_8_16bit / reg_config / power_on_delay / i2c_com 都不例化）
+//   · 不做跨时钟域（fram_buf 内部自己做 vin_clk→ddr_clk→vout_clk 三次跨域）
+//
+// ★ 2026-10-17 变更：**加上了 HDMI 视频输出**
+//   原来这里写着"不接 HDMI 收发视频（只保留 I2C 配置链）"，
+//   现在把 DDR3 读出的图样直接送 MS7210，屏幕能看到画面。
+//   配套改动：
+//     · PLL 换成 hdmi_tx 那份（148.4375MHz），因为 MS7210 的配置
+//       与 hdmi_tx 完全相同、按 ~148.5MHz 调好
+//     · 新增 11 个视频输出端口 + constr/ddr3_fb.fdc 里 196 条引脚约束
+//   验收方式：屏幕上出现 DDR3 里的图样 = "写→存→读→显示"整条链路通了。
+//   这比只看 led[3]（verify_ok）更直观 —— 那个逐像素校验本身有相位问题。
+//
+// 来源说明：
+//   本文件是**重建**件。原 `ddr3_fb_top.v` 在文件交接时丢失（.pds 里有登记、
+//   但文件不存在）。重建依据：
+//     · docs/ddr3_fb_说明.md（架构、fram_buf↔DDR3_50H 接线表、参数、LED 表）
+//     · _如何编译（GUI）.md（4 个 LED 的含义与判据）
+//     · 厂商 source/rtl/hdmi_ddr_ov5640_top.v（DDR3 / fram_buf / sync_vg 的
+//       例化方式与端口连接，逐条照抄；去掉摄像头部分）
+//   DDR3 部分的接线**与厂商完全一致**，未做任何改动。
+//=============================================================================
+`timescale 1ns / 1ps
+
+module ddr3_fb_top #(
+    parameter MEM_ROW_ADDR_WIDTH = 15,
+    parameter MEM_COL_ADDR_WIDTH = 10,
+    parameter MEM_BADDR_WIDTH    = 3,
+    parameter MEM_DQ_WIDTH       = 32,
+    parameter MEM_DQS_WIDTH      = 32/8,
+    // fram_buf 的帧尺寸与像素位宽（按 docs 要求设为 1080p / RGB565）
+    parameter H_NUM              = 12'd1920,   // 2026-10-28 改：1080P 宽（契约 §2.1）
+    parameter V_NUM              = 12'd1080,   // 2026-10-28 改：1080P 高
+    parameter PIX_WIDTH          = 16,
+    // ★ 显示模式（**上电默认值**；运行中按 H17 循环 3 态）
+    //   1'b0 = 原图彩色（DDR3 读出的 RGB565 直接送 HDMI）—— 画面清晰
+    //   1'b1 = 灰度    （gray_scale3x：3x3 块平均降采样到 640x360，再 x3 放大回 1080p）
+    //   ★ 第 3 态「2x2 四宫格」只能由 H17 按键进入，不受这个参数控制。
+    //
+    //   ⚠️ 2026-10-20 把默认从 1 改成 0：
+    //     灰度路径经过 3x3 降采样 + x3 放大，**细的斜车道线会呈现断续的台阶感**。
+    //     这不是检测错误 —— lane_detect 吃的是全分辨率原图，判得很准（实测=实线）；
+    //     只是显示路径的降采样把线"块化"了。做车道线演示用原图更清楚。
+    parameter PROC_MODE          = 1'b0,
+    // ★ 2026-10-20：写侧图样选择（车道线检测用）
+    //   1'b0 = 条纹图样（DDR3 逐像素校验用，屏幕上应出现 15 条竖直色带）
+    //   1'b1 = 合成道路场景（scene_gen：路面 + 左右斜车道线 + 斑马线 + 红绿灯）
+    //   要做"车道线识别"演示就用 1；要复核 DDR3 存取正确性就用 0。
+    parameter PATTERN_SEL        = 1'b1,
+    // 2026-10-25 新增：写侧视频源选择
+    //   0 = 本地 sync_vg + 图案/scene_gen/road_rom（原来的行为，8 个显示模式都靠它）
+    //   1 = ★ 真实 HDMI 输入（de_in 驱动的 hdmi_wr，不依赖 vs_in）
+    parameter SRC_HDMI            = 1'b1,
+
+    // 2026-10-27 added: OV5640 camera as the write-side source (takes priority)
+    //   1 = camera (default: we want to see the camera picture immediately)
+    //   0 = fall back to SRC_HDMI (HDMI input) / pattern generator
+    parameter SRC_CAM             = 1'b1,   // 2026-10-28 打开：摄像头直连帧缓存
+    // ⭐ 2026-10-28: 1 = 双路左右同屏（行缓存合成），0 = 原来的交替显示
+parameter MOSAIC_EN          = 1'b0,   // ★ 版本一：不用摄像头合成
+    // 心跳灯翻转周期（core_clk 拍数）。core_clk = 100MHz -> 约 0.67s
+    parameter TH_1S              = 27'd67_000_000,
+    // PLL 锁定后延时多少拍释放 rstn_out。
+    //   真件用 16'h2710 = 10000 拍 -> 在 cfg_clk(约10MHz) 下约 1ms，
+    //   与厂商 hdmi_ddr_ov5640_top 的做法一致。
+    //   仿真时把它调小，否则要跑 1ms 才出复位，仿真会显得"卡住"。
+    parameter [15:0] RSTN_1MS_MAX = 16'h2710
+)(
+    input  wire                          sys_clk,          // 50MHz 板载晶振 (P20)
+    output wire                          hdmi_rst,         // R17  HDMI 输入侧复位/EDID 使能（0.2ms 后永久拉高）
+
+    // ---- 模式切换按键（2026-10-18 新增，2026-10-18 晚修正）----
+    //
+    //   ⚠️ 这里有一段"官方资料 vs 实测"的矛盾，记清楚免得以后再踩：
+    //      · 官方《MES50H-HDMI 硬件指导手册》表 3-6 说 8 个用户按键是
+    //          KEY1..KEY8 = B1, R9, R8, U6, T7, W9, Y8, Y7   （低电平有效）
+    //      · 但板子丝印确实是 KEY1~KEY8，实测"按 KEY8 能切模式"时
+    //        我们代码里接的却是 K18 / H17（都不在官方表里）
+    //      -> 说明**这块板的实际映射和手册表格对不上**，或者手册对应的是
+    //         另一个版本/另一块底板。所以两边都接，以实测为准。
+    //
+    //   策略：8 个官方用户按键 + K18（厂商 DDR3 例程里叫 rst_board）
+    //         + H17（重加载键，官方文档说它经延时复位芯片接 RSTN）
+    //         全部低有效，**任意一个按下都切换模式**。
+    //         哪个真的能用以实测为准，测出来后再裁掉多余的。
+    //   ⚠️ 2026-10-18 踩过的坑（记下来，别再犯）：
+    //     官方《MES50H-HDMI 硬件指导手册》表 3-6 说 8 个用户按键是
+    //       KEY1..KEY8 = B1, R9, R8, U6, T7, W9, Y8, Y7
+    //     但**按这张表接上去，有 6 个引脚和已有 BANK 的 VCCIO 冲突**
+    //     （Y8/M5/H1/H2 撞 DDR3 的 1.5V BANK；T7/U6/W9 等又撞 HDMI 输出的 BANK），
+    //     PDS 报 `ConstraintEditor-0003: VCCIO value in the same BANK should be the same`。
+    //
+    //     **结论：这块板的实际引脚映射和那份手册对不上，以实测为准。**
+    //     实测结论（你按 KEY8 能切模式时，代码里接的是下面两个）：
+    //       key   = K18
+    //       rst_n = H17（官方文档说它是重加载键，经延时复位芯片接 RSTN）
+    //     两个都低有效、都加上拉，任一按下都切换 原图/灰度。
+    input  wire                          key,              // K18
+    input  wire                          rst_n,            // H17  重加载键
+
+    // ---- DDR3 颗粒接口（71 根，引脚由 constr/ddr3_fb.fdc 固定，不可改）----
+    output wire                          mem_rst_n,
+    output wire                          mem_ck,
+    output wire                          mem_ck_n,
+    output wire                          mem_cke,
+    output wire                          mem_cs_n,
+    output wire                          mem_ras_n,
+    output wire                          mem_cas_n,
+    output wire                          mem_we_n,
+    output wire                          mem_odt,
+    output wire [MEM_ROW_ADDR_WIDTH-1:0] mem_a,
+    output wire [MEM_BADDR_WIDTH-1:0]    mem_ba,
+    inout  wire [MEM_DQS_WIDTH-1:0]      mem_dqs,
+    inout  wire [MEM_DQS_WIDTH-1:0]      mem_dqs_n,
+    inout  wire [MEM_DQ_WIDTH-1:0]       mem_dq,
+    output wire [MEM_DQS_WIDTH-1:0]      mem_dm,
+
+    // ---- HDMI 芯片 I2C 配置（保留，便于以后接显示）----
+    output wire                          iic_scl,          // MS7200 (HDMI RX)
+    inout  wire                          iic_sda,
+    output wire                          iic_tx_scl,       // MS7210 (HDMI TX)
+    inout  wire                          iic_tx_sda,
+
+    // ---- ★ HDMI 视频输出（2026-10-17 新增）----
+    //   把 DDR3 读出的图样直接送到 MS7210，屏幕上能看到画面。
+    //   引脚与 hdmi_tx 工程完全一致（那是已上板验证过的 8 色竖条）。
+    //   格式：1080p60 RGB888，像素时钟 148.4375MHz（PLL clkout0）。
+    output wire                          pixclk_out,       // M22  148.4375MHz
+    output wire                          vs_out,           // W20
+    output wire                          hs_out,           // Y21
+    output wire                          de_out,           // Y22
+    output wire [7:0]                    r_out,
+    output wire [7:0]                    g_out,
+    output wire [7:0]                    b_out,
+
+    // ---- ★ USB-UART 调试输出（2026-10-24 新增）----
+    //   CP2102，引脚 R9。电平 **1.2V / LVCMOS12**（依据厂商 07_ddr3_test 同一块板）
+    //   用途：把内部状态打印到 PC 串口助手，不再靠看 LED / 拍照读色带
+    output wire                          uart_txd,
+
+    // ---- ★ HDMI 视频输入（2026-10-21 新增）----
+    //   MS7200 的 I2C 配置已经在跑（u_ms72xx_ctl 的 init_over_rx），
+    //   这里只需要接引脚 + 测量，不重复做配置。
+    input  wire                          pixclk_in,        // AA12
+    input  wire                          vs_in,            // W13
+    input  wire                          hs_in,            // V13
+    input  wire                          de_in,            // U13
+    input  wire [7:0]                    r_in,
+    input  wire [7:0]                    g_in,
+    input  wire [7:0]                    b_in,
+
+    // ===== OV5640 摄像头 CMOS1（2026-10-27 新增，引脚从参考项目 fdc 抄）=====
+    inout  wire                          cmos1_scl,        // Y11
+    inout  wire                          cmos1_sda,        // Y13
+    input  wire                          cmos1_vsync,      // U12
+    input  wire                          cmos1_href,       // AB10
+    input  wire                          cmos1_pclk,       // T12
+    input  wire [7:0]                    cmos1_data,       // AB13 AA10 AB11 W11 R11 T11 Y10 V11
+    output wire                          cmos1_reset,      // W10
+
+    // ---- 第二颗 OV5640（2026-10-28 新增，双镜头模组的另一颗）----
+    //   引脚来自参考工程 hdmi_ddr_ov5640_top.v + 它的 fdc，逐条照抄。
+    //   ⚠️ 数据线标准是 LVCMOS12（参考工程也这么写），不是 LVCMOS33。
+    inout  wire                          cmos2_scl,        // V9
+    inout  wire                          cmos2_sda,        // T10
+    input  wire                          cmos2_vsync,      // Y5
+    input  wire                          cmos2_href,       // AB5
+    input  wire                          cmos2_pclk,       // W6
+    input  wire [7:0]                    cmos2_data,       // AB9 Y9 AB8 W8 U9 T8 U8 Y6
+    output wire                          cmos2_reset,      // AB4
+
+    // ---- ★ HDMI_IN3 候选引脚（2026-10-21 晚新增，用于 A/B 对比）----
+    //   板子只有一个 HDMI-IN 口，但手册给了 3 套引脚。
+    //   IN2 的引脚 = 我们的 HDMI-OUT 引脚（已确认），所以不可能是 IN2。
+    //   这里同时接 IN3，和 IN1 做对比，看谁是真信号。
+    input  wire                          pixclk_in3,       // L20
+    input  wire                          vs_in3,           // G22
+    input  wire                          hs_in3,           // G20
+    input  wire                          de_in3,           // F22
+
+    // ---- 状态指示 ----
+    //   led[3:0] = B2/A2/B3/A3
+    //   ⚠️ 2026-10-18：曾试过加一组 led_alt(R3/M5/H1/H2) 做对比，
+    //      但 M5/H1/H2 和 DDR3 共用 1.5V BANK，VCCIO 冲突编译不过，
+    //      已全部撤掉。板上有 8 个用户 LED，但**能安全用的只有这 4 个**。
+    output wire [3:0]                    led
+);
+
+    //========================================================================
+    // 时钟与复位
+    //
+    //   频率来自 pll.idf 的声明，已核对：
+    //     VCO = CLKIN x RATIOM x RATIOF / RATIOI = 50 x 1 x 49 / 2 = 1225 MHz
+    //     clkout0 = 1225 / 33  = 37.12 MHz  (idf 声明 37.125)
+    //     clkout1 = 1225 / 123 =  9.96 MHz  (idf 声明 10.000)
+    //     clkout2 = 1225 / 49  = 25.00 MHz  (idf 声明 25.000)
+    //
+    //   ⚠️ pix_clk 是 37.125MHz，**不是** 1080p60 的 74.25MHz。
+    //      这个 PLL 配置是给 720p30 用的（厂商把 clkout0 注释成 "37.125M 720P30"）。
+    //      本设计仍用 1080p 的消隐参数，于是读侧实际帧率 = 37.125M / (2200*1125)
+    //      ≈ 15fps。功能与逐像素校验都不受影响，只是刷得慢 —— 本工程是 DDR3
+    //      数据通路的自检，不是显示工程，所以可以接受。
+    //      若要真正的 1080p60，需要重新生成 PLL（只能走 GUI 的 IP 管理器），
+    //      把 clkout0 改成 74.25MHz。
+    //========================================================================
+    wire pix_clk;      // 148.4375MHz -> 读侧像素时钟（1080p60，见下方说明）
+    wire cfg_clk;      //   9.979MHz -> 只给 I2C 配置和上电复位用（写侧已改到 pix_clk）
+    wire locked;
+    wire core_clk;     // DDR3 IP 输出的用户时钟（约 100MHz）
+    wire ddr_init_done;
+
+    //========================================================================
+    // ★ 2026-10-17 变更：PLL 换成 hdmi_tx 的那一份（148.4375MHz）
+    //
+    //   原因：**要让 HDMI 输出真正出画面，像素时钟必须是 MS7210 期望的频率。**
+    //     · ms7210_ctl.v 与 hdmi_tx 工程里的**完全相同**（MD5 C0B2C223），
+    //       而 hdmi_tx 已验证能出 8 色竖条 -> 它期望 ~148.5MHz 像素时钟。
+    //     · 原来的 PLL clkout0 = 1225/33 = 37.12MHz，配 1080p 消隐参数
+    //       -> 实际帧率 15fps，**不是标准 HDMI 格式**，显示器锁不上。
+    //     · 50MHz 晶振**无法整数分频出 74.25MHz**（74.25/50 = 1.485），
+    //       所以不能做 1080p30；但 148.4375MHz（偏差 -0.04%）是可行的。
+    //
+    //   新 PLL（抄自 hdmi_tx/ipcore/PLL）：
+    //     VCO = 50 x 1 x 95 / 4 = 1187.5 MHz
+    //     clkout0 = 1187.5 / 8   = 148.4375 MHz  -> pix_clk (1080p60)
+    //     clkout1 = 1187.5 / 119 =   9.979 MHz   -> cfg_clk
+    //   ⚠️ 新 PLL **没有 clkout2**，所以原来接 25MHz 的那根线取消。
+    //     clk_25M 在本设计里从未被使用（原来注释写"保留给摄像头"）。
+    //   备份：source/rtl/pll.bak_37M/（旧的 37.125MHz 版本）
+    //========================================================================
+
+    pll u_pll (
+        .clkin1   (sys_clk ),
+        .clkout0  (pix_clk ),
+        .clkout1  (cfg_clk ),
+        .pll_lock (locked  )
+    );
+
+    // PLL 锁定后延时释放复位（照抄厂商做法，延时长度由 RSTN_1MS_MAX 决定）
+    reg [15:0] rstn_1ms;
+    //====================================================================
+    // HDMI 输入侧复位（2026-10-27 新增）
+    //
+    //   为什么需要：板子的 HDMI 输入口有 DDC/EDID 通道，其使能受 R17(hdmi_rst) 控制。
+    //   sys_top / ddr3_fb 原来【完全没有驱动这个引脚】—— 悬空时如果板上有下拉，
+    //   HDMI 输入部分就一直处于复位状态 → 笔记本读不到 EDID → Windows 认为
+    //   "没接显示器" → 根本不输出 HDMI → 我们这边收到的全是引脚噪声（满屏雪花）。
+    //
+    //   做法照抄 video_in 工程（上板验证过）：
+    //     上电后先拉低约 0.2ms（10000 个 sys_clk 周期）再永久拉高。
+    //     16'h2710 = 10000。
+    //====================================================================
+    reg [15:0] hdmi_rst_cnt;
+
+    // ★ 故意不带复位：FPGA 配置完成后所有寄存器清零，计数器自然从 0 开始数，
+    //   数满 10000 后永久停止 -> hdmi_rst 永久为高。这样按复位键(H17)不会碰 EDID。
+    always @(posedge sys_clk) begin
+        if (hdmi_rst_cnt != 16'h2710) begin
+            hdmi_rst_cnt <= hdmi_rst_cnt + 16'd1;
+        end
+    end
+
+    assign hdmi_rst = (hdmi_rst_cnt == 16'h2710);
+
+    always @(posedge cfg_clk) begin
+        if (!locked)
+            rstn_1ms <= 16'd0;
+        else if (rstn_1ms == RSTN_1MS_MAX)
+            rstn_1ms <= rstn_1ms;
+        else
+            rstn_1ms <= rstn_1ms + 1'b1;
+    end
+    wire rstn_out = (rstn_1ms == RSTN_1MS_MAX);
+
+    //========================================================================
+    // I2C 配置链（厂商原样）
+    //   本设计不用 HDMI 视频收发，但保留配置链：
+    //     · 让 MS7210 上电后处于可用状态，以后接显示不用重做这里
+    //     · led 里不含 init_over，避免"芯片没插线就整个工程看起来失败"
+    //========================================================================
+    wire init_over_tx;
+    wire init_over_rx;
+
+    ms72xx_ctl u_ms72xx_ctl (
+        .clk           (cfg_clk   ),
+        .rst_n         (rstn_out  ),
+        .init_over_tx  (init_over_tx),
+        .init_over_rx  (init_over_rx),
+        .iic_tx_scl    (iic_tx_scl),
+        .iic_tx_sda    (iic_tx_sda),
+        .iic_scl       (iic_scl   ),
+        .iic_sda       (iic_sda   )
+    );
+
+    //========================================================================
+    // 写侧：产生 DDR3 写入时序 + 可预测图样
+    //
+    //   时钟用 cfg_clk(9.96MHz) —— 故意用一个"慢且与读侧无关"的时钟：
+    //     · 慢：写侧绝不会跑赢 DDR3 的读回，fram_buf 的写 FIFO 不会溢出
+    //     · 不同步：写读天然不同步，顺带测出 fram_buf 的跨时钟域是否可靠
+    //   代价是帧率低（10MHz / (2200*1125) ≈ 4fps）。本工程是 DDR3 自检，
+    //   不是显示工程，慢一点没问题。
+    //
+    //   注：说明文档里写的是"写 50MHz ≈ 20.2fps"，那是原设计的数字。
+    //   本 PLL 没有 50MHz 输出（只有 37.125/10/25MHz），所以这里用 cfg_clk。
+    //   要精确复现原速率，需要在 GUI 里重新生成 PLL。
+    //========================================================================    wire        wr_vs, wr_hs, wr_de, wr_de_re;
+    wire [11:0] wr_x, wr_y;
+
+    sync_vg #(
+        .X_BITS   (12),
+        .Y_BITS   (12),
+        // 1080p60 时序（与读侧同参数，但时钟只有 10MHz，所以实际帧率很低）
+        .V_TOTAL  (12'd1125),
+        .V_FP     (12'd4),
+        .V_BP     (12'd36),
+        .V_SYNC   (12'd5),
+        .V_ACT    (12'd1080),
+        .H_TOTAL  (12'd2200),
+        .H_FP     (12'd88),
+        .H_BP     (12'd148),
+        .H_SYNC   (12'd44),
+        .H_ACT    (12'd1920),
+        .HV_OFFSET(12'd0)
+    ) u_wr_sync (
+        .clk    (pix_clk ),
+        .rstn   (rstn_out),
+        .vs_out (wr_vs   ),
+        .hs_out (wr_hs   ),
+        .de_out (wr_de   ),
+        .de_re  (wr_de_re),
+        .x_act  (wr_x    ),
+        .y_act  (wr_y    )
+    );
+
+    // 写侧图样：两种可选（由 PATTERN_SEL 选）
+    //   0 = 条纹图样（DDR3 逐像素校验用：屏幕上应出现 15 条竖直色带）
+    //       低 8 位 = 列号低 8 位，高 4 位 = 行号低 4 位，次低 4 位 = 行号高 4 位
+    //   1 = 合成道路场景（车道线检测用）
+    //   注意 x_act / y_act 在消隐期会超出有效范围，但 de 会把它挡住，
+    //   fram_buf 只在 wr_en=1 时采样，所以无需额外钳位。
+    wire [15:0] wr_pixel_stripe = {wr_y[3:0], wr_x[7:0], wr_y[7:4]};
+
+    //========================================================================
+    // ★ 合成道路场景（2026-10-20 新增，来自 detect_chain/src/scene_gen.v）
+    //
+    //   纯组合比较器画一幅 1920x1080 的"测评场景"，**不占 ROM、不用外部图源**
+    //   —— 这样在没有真实摄像头 / HDMI 输入没通的情况下，
+    //     整条感知链（rgb2gray→gauss3x3→binarize→lane_detect）也能真跑起来。
+    //
+    //   画面布局（坐标与 sync_vg 的 x_act/y_act 一致）：
+    //     y   0 ~ 359   暗背景 + 中央红绿灯方块 (x 900~1020)
+    //     y 360 ~ 591   暗背景
+    //     y 592 ~1079   路面灰 + 左右两条斜车道线（斜率 1/4，宽 16 px）
+    //     y 860 ~ 960   斑马线带（竖向白条，每 32 px 一条）
+    //
+    //   ★ 关键：scene_gen 的输出**寄存了 1 拍**（原作者为了让比较器不进
+    //     时序关键路径这么做的），所以它的 o_de/o_hs 也必须一起用，
+    //     否则 wr_data 和 wr_en 会错开 1 拍，写进 DDR3 的图像整体右移一列。
+    //========================================================================
+    wire        sc_de, sc_hs, sc_vs;
+    wire [23:0] sc_rgb888;
+    wire [15:0] sc_rgb565;
+
+    //========================================================================
+    // ★ 红绿灯循环（2026-10-21 新增，补验收点 #7「红灯停/绿灯行」）
+    //
+    //   原来 tl_color 固定 2'd2（绿灯），所以 ctrl_fsm 永远在 S_MOVE，
+    //   只演示了"箭头 + 按键切车道"，没演示红灯停车。
+    //
+    //   现在让红绿灯自己循环（每种颜色 2 秒）：
+    //     绿(2) -> 红(0) -> 黄(1) -> 绿(2) -> ...
+    //
+    //   ★ 编码正好一致，可以直接一根线接到两处：
+    //       scene_gen.tl_color : 0=红 1=黄 2=绿
+    //       ctrl_fsm.i_tl      : TL_RED=0 TL_YELLOW=1 TL_GREEN=2
+    //
+    //   ctrl_fsm 的响应：
+    //     绿灯 -> S_MOVE  (o_motion = 1)
+    //     红/黄 -> S_SLOW (8 帧) -> S_STOP (o_motion = 0)
+    //     回绿 -> 再等 MIN_STOP(8 帧) 才回 S_MOVE
+    //========================================================================
+    localparam [27:0] TL_TICK = 28'd148_437_500;   // @148.4375MHz = 1 秒
+
+    reg [27:0] tl_cnt;
+    reg [1:0]  tl_sec;        // 0..1，两秒换一次颜色
+    reg [1:0]  tl_color;
+
+    always @(posedge pix_clk or negedge fb_init_done) begin
+        if (!fb_init_done) begin
+            tl_cnt   <= 28'd0;
+            tl_sec   <= 2'd0;
+            tl_color <= 2'd2;              // 上电绿灯
+        end else if (tl_cnt == TL_TICK) begin
+            tl_cnt <= 28'd0;
+            if (tl_sec == 2'd1) begin
+                tl_sec   <= 2'd0;
+                tl_color <= (tl_color == 2'd2) ? 2'd0 : tl_color + 2'd1;
+            end else begin
+                tl_sec <= tl_sec + 2'd1;
+            end
+        end else begin
+            tl_cnt <= tl_cnt + 28'd1;
+        end
+    end
+
+    scene_gen u_scene (
+        .clk      (pix_clk ),
+        .rst_n    (rstn_out),
+        .i_de     (wr_de   ),
+        .i_hs     (wr_hs   ),
+        .i_vs     (wr_vs   ),
+        .x        (wr_x    ),
+        .y        (wr_y    ),
+        .tl_color (tl_color),      // ★ 红绿灯循环（上面生成的）
+        .o_de     (sc_de   ),
+        .o_hs     (sc_hs   ),
+        .o_vs     (sc_vs   ),
+        .o_rgb888 (sc_rgb888),
+        .o_rgb565 (sc_rgb565),
+        .o_x      (         ),
+        .o_y      (         )
+    );
+
+    // ---- 写侧最终信号（场景模式下连 de 也一起换成 scene_gen 的延迟版）----
+    //========================================================================
+    // ★ 3 位显示模式：[2]=图像源(0合成/1真实)  [1:0]=显示方式(原图/灰度/四宫格/调试)
+    reg  [2:0] disp_mode;            // 提前声明：写侧要用 disp_mode[2] 选图源
+
+    // ★ 真实道路图像 ROM（2026-10-24 新增，验收点 #6）
+    //
+    //   PATTERN_SEL = 0 : 条纹图样（DDR3 逐像素校验）
+    //   PATTERN_SEL = 1 : 图像（由 disp_mode[2] 决定用哪个源）
+    //       disp_mode[2] = 0 -> scene_gen（合成道路场景，带红绿灯轮换）
+    //       disp_mode[2] = 1 -> road_rom （真实行车记录仪画面）
+    //
+    //   rom 地址 = ys*240 + xs，其中 xs = wr_x[11:3]、ys = wr_y[10:3]，
+    //   即**8 倍最近邻放大**（1920/8=240、1080/8=135，整数倍，零插值逻辑）。
+    //   ys*240 = (ys<<8) - (ys<<4)，用移位减法，不占乘法器。
+    //
+    //   ⚠️ BRAM 读延迟 1 拍，所以 de 也要延迟 1 拍才能和数据对齐，
+    //      否则写进 DDR3 的图像整体右移一列。
+    //========================================================================
+    wire use_road = disp_mode[2];   // 0 = scene_gen（合成）, 1 = road_rom（真实）
+
+    wire [11:0] rom_xs = wr_x;          // 12 位，后面取 [11:3]
+    wire [11:0] rom_ys = wr_y;
+    wire [8:0]  rom_x  = rom_xs[11:3];  // 0..239
+    wire [7:0]  rom_y  = rom_ys[10:3];  // 0..134
+    // ⚠️ 位宽坑：左移结果取的是【左操作数的位宽】，15 位会溢出。
+    //   134<<8 = 34304 需要 16 位。所以中间量用 17 位再截到 15 位。
+    wire [16:0] rom_y17   = {9'd0, rom_y};
+    wire [16:0] rom_row   = (rom_y17 << 8) - (rom_y17 << 4);   // y*240，最大 32160
+    wire [16:0] rom_sum   = rom_row + {8'd0, rom_x};           // 最大 32399
+    wire [14:0] rom_addr  = rom_sum[14:0];                    // 32400 < 32768 ✅
+
+    wire [15:0] rom_dout;
+    road_rom u_road_rom (
+        .clk  (pix_clk   ),
+        .addr (rom_addr  ),
+        .dout (rom_dout  )
+    );
+
+    reg wr_de_d1;
+    always @(posedge pix_clk or negedge rstn_out) begin
+        if (!rstn_out) wr_de_d1 <= 1'b0;
+        else           wr_de_d1 <= wr_de;
+    end
+
+    //========================================================================
+    // ★ 真实 HDMI 写侧（2026-10-25 新增）
+    //
+    //   依据实测（video_in 工程 PROBE_MODE=10）：
+    //     de_in(U13) 的上升沿 >= 30kHz = 行频  -> DE 完全正常
+    //     vs_in(W13) 不是可用的场同步           -> 这就是原来锁不上的原因
+    //
+    //   参考 2023 一等奖方案 video_zoom.v：像素采集不依赖 vs，只用 vs 复位地址。
+    //   我们更进一步：**完全不用 vs**，用 DE 的个数（每帧恰好 1080 个）自己造场同步。
+    //   1080p60 的行数固定，所以自对齐、误差不累积。
+    //========================================================================
+    wire        hd_vs, hd_de;
+    wire [15:0] hd_rgb565;
+
+    hdmi_wr u_hdmi_wr (
+        .clk      (pixclk_in),
+        .rst_n    (rstn_out  ),
+        .de       (de_in     ),
+        .r        (r_in      ),
+        .g        (g_in      ),
+        .b        (b_in      ),
+        .o_vs     (hd_vs     ),
+        .o_de     (hd_de     ),
+        .o_rgb565 (hd_rgb565 )
+    );
+
+    // 写侧四根信号：SRC_HDMI=1 时全部来自真实 HDMI；否则保持原来的图案/场景路径
+    //====================================================================
+    // OV5640 摄像头链路（2026-10-27 新增）
+    //
+    //   照抄官方 10_HDMI_DDR3_OV5640_test 例程：
+    //     power_on_delay  -> 上电时序（复位 + PWDN + initial_en）
+    //     reg_config      -> I2C 配寄存器（720P RGB565 输出）
+    //     cmos_8_16bit    -> 8bit DVP 双像素合并成 16bit RGB565
+    //
+    //   ★ clk_25M 由 sys_clk(50MHz) 二分频得到，不额外占 PLL。
+    //   ★ 时钟不带复位：上电即开始翻转，避免按复位键重新配置摄像头。
+    //====================================================================
+    reg clk_25m_r;
+    always @(posedge sys_clk) clk_25m_r <= ~clk_25m_r;
+    wire clk_25m = clk_25m_r;
+
+    wire cam_initial_en;
+    wire cam_init_done;
+    wire cam_clock_20k;
+    wire [8:0] cam_reg_index;
+    wire [15:0] cam_nack_cnt;   // I2C NACK 次数（诊断用）
+
+    power_on_delay u_cam_pwr (
+        .clk_50M      (sys_clk        ),
+        .reset_n      (1'b1           ),   // 2026-10-28 改：照抄官方 demo 接常量高，
+                                            //   原来接 rst_n(H17)，而 fdc 给该引脚 PAP_IO_NONE（无上下拉），
+                                            //   悬空时上电时序走不完 -> initial_en 不出 -> I2C 配置从不开始
+        .camera1_rstn (cmos1_reset    ),
+        .camera2_rstn (cmos2_reset    ),   // 2026-10-28: 第二颗复位（同一路时序）
+        .camera_pwnd  (               ),
+        .initial_en   (cam_initial_en )
+    );
+
+    reg_config u_cam_cfg (
+        .clk_25M      (clk_25m        ),
+        .camera_rstn  (cmos1_reset    ),
+        .initial_en   (cam_initial_en ),
+        .reg_conf_done(cam_init_done  ),
+        .i2c_sclk     (cmos1_scl      ),
+        .i2c_sdat     (cmos1_sda      ),
+        .clock_20k    (cam_clock_20k  ),
+        .reg_index    (cam_reg_index  ),
+        .o_nack_cnt   (cam_nack_cnt   )
+    );
+
+    //--------------------------------------------------------------------
+    // 第二颗 OV5640 的 I2C 配置（2026-10-28 新增）
+    //   和第一颗完全相同的寄存器表，但走 cmos2_scl / cmos2_sda。
+    //   两颗共用同一个 power_on_delay（复位时序相同），所以 initial_en 一样。
+    //--------------------------------------------------------------------
+    wire        cam2_init_done;
+    wire [15:0] cam2_nack_cnt;
+
+    reg_config u_cam2_cfg (
+        .clk_25M      (clk_25m        ),
+        .camera_rstn  (cmos2_reset    ),
+        .initial_en   (cam_initial_en ),
+        .reg_conf_done(cam2_init_done ),
+        .i2c_sclk     (cmos2_scl      ),
+        .i2c_sdat     (cmos2_sda      ),
+        .clock_20k    (               ),
+        .reg_index    (               ),
+        .o_nack_cnt   (cam2_nack_cnt  )
+    );
+
+    //--------------------------------------------------------------------
+    //--------------------------------------------------------------------
+    // 官方 cmos_8_16bit（2026-10-27 恢复）
+    //
+    //   ★ 为什么必须用它，不能自己写拼像素：
+    //     fram_buf 内部的 wr_buf.v 里，行内像素计数 x_cnt 是这么走的：
+    //         else if(wr_en & wr_enable) x_cnt <= x_cnt + 1;
+    //         else                       x_cnt <= 12'd0;   // ← wr_en 一低就清零
+    //     所以 wr_en 必须在【整行有效期间连续为高】。
+    //     自己写的"每隔一个 pclk 出一次 de"会让 x_cnt 每拍归零，永远写不进一行。
+    //
+    //   ★ 官方做法：用 GTP_IOCLKBUF + GTP_IOCLKDIV 生成 pclk/2 的独立时钟，
+    //     在那个时钟域里 de_o 是整行连续的 —— 这才是正确的。
+    //   ★ 它的 enble 需要 VS 上升沿才放行，而我们已经确认 VSYNC 在跳，没问题。
+    //--------------------------------------------------------------------
+    reg [7:0] cam_d_d0;
+    reg       cam_href_d0, cam_vsync_d0;
+    always @(posedge cmos1_pclk) begin
+        cam_d_d0     <= cmos1_data;
+        cam_href_d0  <= cmos1_href;
+        cam_vsync_d0 <= cmos1_vsync;
+    end
+
+    wire [15:0] cam_d_16bit;
+    wire        cam_de_16bit;
+    wire        cam_pclk_16bit;
+
+    cmos_8_16bit u_cam_8_16 (
+        .pclk      (cmos1_pclk       ),
+        .rst_n     (cam_init_done    ),   // I2C 配置完成后释放复位
+        .pdata_i   (cam_d_d0         ),
+        .de_i      (cam_href_d0      ),
+        .vs_i      (cam_vsync_d0     ),
+        .pixel_clk (cam_pclk_16bit   ),
+        .pdata_o   (cam_d_16bit      ),
+        .de_o      (cam_de_16bit     )
+    );
+
+    // 字节序重排（照抄官方例程）：{d[4:0], d[10:5], d[15:11]} = {R5,G6,B5}
+    wire [15:0] cam_rgb565 = {cam_d_16bit[4:0], cam_d_16bit[10:5], cam_d_16bit[15:11]};
+    wire        cam_vs     = cam_vsync_d0;
+
+    //--------------------------------------------------------------------
+    // 第二颗 OV5640 的数据通路（2026-10-28 新增）
+    //   ⚠️ 实例名必须是 cmos2_8_16bit：fdc 里的 create_generated_clock
+    //      引用的是 [get_pins {cmos2_8_16bit/pixel_clk}]，改名会导致约束
+    //      匹配不到对象，PDS 直接 abort。
+    //--------------------------------------------------------------------
+    reg [7:0] cam2_d_d0;
+    reg       cam2_href_d0, cam2_vsync_d0;
+    always @(posedge cmos2_pclk) begin
+        cam2_d_d0     <= cmos2_data;
+        cam2_href_d0  <= cmos2_href;
+        cam2_vsync_d0 <= cmos2_vsync;
+    end
+
+    wire [15:0] cam2_d_16bit;
+    wire        cam2_de_16bit;
+    wire        cam2_pclk_16bit;
+
+    cmos_8_16bit cmos2_8_16bit (
+        .pclk      (cmos2_pclk       ),
+        .rst_n     (cam2_init_done   ),
+        .pdata_i   (cam2_d_d0        ),
+        .de_i      (cam2_href_d0     ),
+        .vs_i      (cam2_vsync_d0    ),
+        .pixel_clk (cam2_pclk_16bit  ),
+        .pdata_o   (cam2_d_16bit     ),
+        .de_o      (cam2_de_16bit    )
+    );
+
+    wire [15:0] cam2_rgb565 = {cam2_d_16bit[4:0], cam2_d_16bit[10:5], cam2_d_16bit[15:11]};
+    wire        cam2_vs     = cam2_vsync_d0;
+
+    //--------------------------------------------------------------------
+    // 双摄像头运行时轮换（2026-10-28 新增）
+    //
+    //   ★ 为什么必须在【帧边界】切换：
+    //     wr_buf 的 y_cnt 由 wr_fsync 上升沿复位。若在行中间切换时钟/数据，
+    //     一帧里会混两颗摄像头的内容 -> 画面撕裂。
+    //     所以先发"切换请求"，等【当前正在显示的这颗】的 VSYNC 上升沿才真正切。
+    //
+    //   ★ 为什么要 2 级同步：两路 VSYNC 各自在 pclk 域，跨到 sys_clk 判边沿
+    //     必须先打两拍，否则亚稳态会导致误切换。
+    //
+    //   ★ 为什么 cam_sel 只在 cam2_init_done 后才允许变 1：
+    //     否则第二颗没配好就切过去 -> 画面全黑。
+    //--------------------------------------------------------------------
+    reg [1:0] c1vs_s, c2vs_s;
+    always @(posedge sys_clk) begin
+        c1vs_s <= {c1vs_s[0], cam_vs };
+        c2vs_s <= {c2vs_s[0], cam2_vs};
+    end
+    wire c1vs_rise = (c1vs_s == 2'b01);
+    wire c2vs_rise = (c2vs_s == 2'b01);
+
+    // 轮换定时器：2^26 / 50MHz = 1.34 秒切一次
+    reg [25:0] cam_swap_cnt;
+    always @(posedge sys_clk) cam_swap_cnt <= cam_swap_cnt + 26'd1;
+
+    reg cam_sel;        // 0 = 摄像头1, 1 = 摄像头2
+    reg cam_sel_req;
+    always @(posedge sys_clk) begin
+        if (!fb_init_done) begin
+            cam_sel     <= 1'b0;
+            cam_sel_req <= 1'b0;
+        end
+        else if (cam_sel_req) begin
+            // 等当前这颗的帧边界再切
+            if ((cam_sel == 1'b0 && c1vs_rise) || (cam_sel == 1'b1 && c2vs_rise)) begin
+                cam_sel     <= ~cam_sel;
+                cam_sel_req <= 1'b0;
+            end
+        end
+        else if (cam_swap_cnt == 26'd0) begin
+            if (cam_sel == 1'b0 && cam2_init_done) cam_sel_req <= 1'b1;
+            else if (cam_sel == 1'b1)              cam_sel_req <= 1'b1;
+        end
+    end
+
+    wire        cam_ready   = cam_init_done;
+    wire        cam1_active = SRC_CAM && cam_init_done  && !cam_sel;
+    wire        cam2_active = SRC_CAM && cam2_init_done &&  cam_sel;
+    wire        wr_use_cam  = cam1_active || cam2_active;
+
+    //--------------------------------------------------------------------
+    // 双路左右同屏合成器（2026-10-28 新增）
+    //   MOSAIC_EN=1 时，写侧用 sys_clk + 合成帧（左640=cam1，右640=cam2），
+    //   完全不依赖摄像头时钟，也不需要 AXI 仲裁器。
+    //--------------------------------------------------------------------
+    wire        mosaic_fsync;
+    wire        mosaic_de;
+    wire [15:0] mosaic_pix;
+    wire [15:0] q_srcw1, q_srcw2;
+    wire [15:0] q_botline, q_camlines;
+
+    // ★ 2026-10-28 改：四路合成写器（上=HDMI，下=双摄）
+    // ★ v2 架构：摄像头 -> framebuf 整帧缓存；HDMI -> BRAM 行缓存
+    // ★ v3 架构：写时钟固定 pixclk_in，自己数 1080 行，上下半屏全部进 framebuf
+    compose_wr #(.H_LINE(1920), .V_TOP(540), .V_BOT(540), .H_CELL(960)) u_compose (
+        .clk       (pixclk_in       ),
+        .rst_n     (rstn_out        ),
+        .hd_de     (hd_de           ),
+        .hd_pix    (hd_rgb565       ),
+        .hd_vs     (hd_vs           ),
+        .c1_clk    (cam_pclk_16bit  ),
+        .c1_vs     (cam_vs          ),
+        .c1_de     (cam_de_16bit    ),
+        .c1_pix    (cam_rgb565      ),
+        .c2_clk    (cam2_pclk_16bit ),
+        .c2_de     (cam2_de_16bit   ),
+        .c2_pix    (cam2_rgb565     ),
+        .o_de      (mosaic_de       ),
+        .o_pix     (mosaic_pix      ),
+        .o_fsync   (mosaic_fsync    ),
+        .dbg_srcw1 (q_srcw1         ),
+        .dbg_srcw2 (q_srcw2         ),
+        .dbg_botline (q_botline     ),
+        .dbg_camlines(q_camlines    )
+    );
+
+    wire        wr_vin_clk = pixclk_in;   // ★ 隔离实验：统一用 pixclk_in
+                             // (原: cam1_active ? cam_pclk_16bit : ...)
+                             // (原 SRC_HDMI 分支)
+    // ★★ 隔离实验：强制使用内置测试场景（sc_de / sc_rgb565），不经过摄像头/HDMI/FSM
+    // ★ 把显示 vsync 同步到写时钟域，作为写侧帧基准（消除 0.042% 时钟漂移）
+    reg [2:0] rdvs_s;
+    always @(posedge pixclk_in or negedge rstn_out) begin
+        if (!rstn_out) rdvs_s <= 3'd0;
+        else           rdvs_s <= {rdvs_s[1:0], rd_vs};
+    end
+    wire rdvs_rise = (rdvs_s[2:1] == 2'b01);
+    reg  [1:0] wr_div2;
+    always @(posedge pixclk_in or negedge rstn_out) begin
+        if (!rstn_out)      wr_div2 <= 2'd0;
+        else if (rdvs_rise) wr_div2 <= wr_div2 + 2'd1;
+    end
+    wire wr_frame_sync = rdvs_rise & (wr_div2 == 2'd3);   // 每 4 个显示帧一次 = 66.7ms
+    //========================================================================
+    // ★★★ 版本二（2026-10-30，第二版）：左半 HDMI 视频 + 右半 摄像头整帧 ★★★
+    //
+    //   上一版把"当前摄像头行"直接塞进 HDMI 写侧，上板看到的是：
+    //     · 右半是"半帧扫描带"（摄像头 720P@30，一个 60fps 显示帧只给半帧）
+    //     · 摄像机帧回绕的接缝落在画面中间，并随两个时钟相位漂移慢慢滚动
+    //     · 整帧被拉成 3 倍，糊 + 条纹
+    //   根因：一个写口装不下两个不同帧率的源。
+    //
+    //   现在改成"两块独立的 DDR3 帧缓存"（见文件末尾的 fram_buf_dual）：
+    //     · 显示帧 1920x1080@60fps —— 左半 = HDMI 视频（与版本一完全一样）
+    //     · 摄像头帧 960x1080@30fps —— cam_frm_wr 把 720 行拉伸成 1080 行，
+    //       并且用摄像头 VSYNC 做帧同步（写侧行计数从摄像机帧起点开始）
+    //     · 两块缓存共用一个 wr_rd_ctrl_top（一个 DDR3 AXI 口），内部仲裁
+    //     · 输出端按 rd_x 选：x<960 取显示帧，x>=960 取摄像头帧
+    //   右半屏每 33ms 得到一张完整、对齐的摄像头图像（1.5 倍纵向拉伸），
+    //   再由 60fps 的显示重复两遍 —— 没有回绕接缝，也不会闪。
+    //========================================================================
+    //========================================================================
+    // ★ 摄像头写流（2026-10-30 晚重构）：跑摄像头自己的时钟 cam_pclk_16bit，1:1 写。
+    //
+    //   上一版这里是 cam_lb1(1280->960 抽稀) + cam_frm_wr 跑在 pixclk_in(148.5MHz) 域，
+    //   并且在写侧用 phase 拉伸（每两行中的一行写两遍）。上板症状：花屏/错位/斜纹。
+    //   两条根因：
+    //     · 写侧跨时钟域：摄像头行事件在 148.5MHz 域采样会漏采/多采 ->
+    //       wr_buf 行指针与摄像头行号慢慢错开 -> 斜纹、逐帧滚动
+    //     · 写侧做拉伸：一个源行被写两遍，写指针与源行不 1:1 -> 行错位/花屏
+    //   现在两条都去掉：一个摄像头行 = 一个帧缓存行，拉伸全部移到读侧
+    //   cam_line_rd 的 Bresenham（水平 640->960、垂直 480->1080）。
+    //
+    //   cmos_8_16bit 的 de_o/pdata_o 本来就在 cam_pclk_16bit 域、每拍 1 像素，
+    //   所以这里就是 4 根线的直通 —— 和 1944 黄金版同一套接法。
+    //========================================================================
+    // ★ 摄像头原生尺寸（写侧 1:1 的目标尺寸，也是读侧 Bresenham 的源尺寸）
+    //   ⚠️ 这两个数必须等于摄像头真实行宽/行数。640x480 是当前认定值；
+    //      若上板实测出来的每帧行数不是 480，只改 CAM_SRC_H 一处即可。
+    localparam [11:0] CAM_SRC_W = 12'd640;    // 摄像头真实行宽
+    localparam [11:0] CAM_SRC_H = 12'd480;    // 摄像头每帧真实行数
+
+    wire        cam_wr_fsync, cam_wr_en;
+    wire [15:0] cam_wr_px;
+    wire [11:0] cam_lines_dbg;       // 上一帧实测行数（诊断用，暂未接串口）
+
+    cam_frm_wr #(
+        .H_NUM   (CAM_SRC_W      ),
+        .V_NUM   (CAM_SRC_H      )
+    ) u_cam_frm (
+        .clk      (cam_pclk_16bit ),   // ★ 摄像头自己的像素时钟（不是 pixclk_in）
+        .rst_n    (rstn_out       ),
+        .vs_in    (cam_vs         ),
+        .pat_en   (1'b0           ),
+        .de_in    (cam_de_16bit   ),   // ★ 1:1，不再经行缓存
+        .pix_in   (cam_rgb565     ),
+        .o_fsync  (cam_wr_fsync   ),
+        .o_en     (cam_wr_en      ),
+        .o_px     (cam_wr_px      ),
+        .o_rows   (               ),
+        .o_lines  (cam_lines_dbg  )
+    );
+    wire        wr_fsync_f = hd_vs;   // ★ 版本一已验证：1 个 HDMI 帧(1080行) <-> framebuf 1 帧，严格 1:1
+    wire        wr_de_f    = hd_de;       // ★ 版本一已验证：HDMI 全屏直通（左半视频）
+    // 显示帧的右半写什么都行，输出时由摄像头帧缓存覆盖（见 disp_pix）
+    wire [15:0] wr_pixel_f = hd_rgb565;
+    //========================================================================
+    wire        rd_vs, rd_hs, rd_de, rd_de_re;
+    wire [11:0] rd_x, rd_y;
+    wire [15:0] vout_data;
+    wire        vout_de;
+
+    sync_vg #(
+        .X_BITS   (12),
+        .Y_BITS   (12),
+        .V_TOTAL  (12'd1125),   // 2026-10-28 改：1080p60
+        .V_FP     (12'd4   ),
+        .V_BP     (12'd36  ),
+        .V_SYNC   (12'd5   ),
+        .V_ACT    (12'd1080),
+        .H_TOTAL  (12'd2200),
+        .H_FP     (12'd88  ),
+        .H_BP     (12'd148 ),
+        .H_SYNC   (12'd44  ),
+        .H_ACT    (12'd1920),
+        .H_ACT    (12'd1280),
+        .HV_OFFSET(12'd0)
+    ) u_rd_sync (
+        .clk    (pix_clk ),
+        .rstn   (fb_init_done),
+        .vs_out (rd_vs   ),
+        .hs_out (rd_hs   ),
+        .de_out (rd_de   ),
+        .de_re  (rd_de_re),
+        .x_act  (rd_x    ),
+        .y_act  (rd_y    )
+    );
+
+    //========================================================================
+    // DDR3 控制器 IP（厂商原样，接线与 hdmi_ddr_ov5640_top.v 完全一致）
+    //   实例名 u_DDR3_50H 是**必须的**：constraints 里的
+    //   create_generated_clock 引用 u_DDR3_50H.I_GTP_CLKDIV 等引脚路径。
+    //   改名会让那些约束匹配不到对象，VP 流程会直接 abort。
+    //========================================================================
+    wire [MEM_ROW_ADDR_WIDTH+MEM_BADDR_WIDTH+MEM_COL_ADDR_WIDTH-1:0] axi_awaddr;
+    wire [3:0]  axi_awuser_id;
+    wire [3:0]  axi_awlen;
+    wire        axi_awready;
+    wire        axi_awvalid;
+    wire [MEM_DQ_WIDTH*8-1:0] axi_wdata;
+    wire [MEM_DQ_WIDTH-1:0]   axi_wstrb;
+    wire        axi_wready;
+    wire        axi_wusero_last;
+    wire [MEM_ROW_ADDR_WIDTH+MEM_BADDR_WIDTH+MEM_COL_ADDR_WIDTH-1:0] axi_araddr;
+    wire [3:0]  axi_aruser_id;
+    wire [3:0]  axi_arlen;
+    wire        axi_arready;
+    wire        axi_arvalid;
+    wire [MEM_DQ_WIDTH*8-1:0] axi_rdata;
+    wire        axi_rvalid;
+    wire [3:0]  axi_rid;
+    wire        axi_rlast;
+    wire        pll_lock_ddr;
+
+    DDR3_50H u_DDR3_50H (
+        .ref_clk                 (sys_clk        ),
+        .resetn                  (rstn_out       ),
+        .ddr_init_done           (ddr_init_done  ),
+        .ddrphy_clkin            (core_clk       ),
+        .pll_lock                (pll_lock_ddr   ),
+
+        .axi_awaddr              (axi_awaddr     ),
+        .axi_awuser_ap           (1'b0           ),
+        .axi_awuser_id           (axi_awuser_id  ),
+        .axi_awlen               (axi_awlen      ),
+        .axi_awready             (axi_awready    ),
+        .axi_awvalid             (axi_awvalid    ),
+        .axi_wdata               (axi_wdata      ),
+        .axi_wstrb               (axi_wstrb      ),
+        .axi_wready              (axi_wready     ),
+        .axi_wusero_id           (               ),
+        .axi_wusero_last         (axi_wusero_last),
+        .axi_araddr              (axi_araddr     ),
+        .axi_aruser_ap           (1'b0           ),
+        .axi_aruser_id           (axi_aruser_id  ),
+        .axi_arlen               (axi_arlen      ),
+        .axi_arready             (axi_arready    ),
+        .axi_arvalid             (axi_arvalid    ),
+        .axi_rdata               (axi_rdata      ),
+        .axi_rid                 (axi_rid        ),
+        .axi_rlast               (axi_rlast      ),
+        .axi_rvalid              (axi_rvalid     ),
+
+        .apb_clk                 (1'b0           ),
+        .apb_rst_n               (1'b1           ),
+        .apb_sel                 (1'b0           ),
+        .apb_enable              (1'b0           ),
+        .apb_addr                (8'b0           ),
+        .apb_write               (1'b0           ),
+        .apb_ready               (               ),
+        .apb_wdata               (16'b0          ),
+        .apb_rdata               (               ),
+        .apb_int                 (               ),
+
+        .mem_rst_n               (mem_rst_n      ),
+        .mem_ck                  (mem_ck         ),
+        .mem_ck_n                (mem_ck_n       ),
+        .mem_cke                 (mem_cke        ),
+        .mem_cs_n                (mem_cs_n       ),
+        .mem_ras_n               (mem_ras_n      ),
+        .mem_cas_n               (mem_cas_n      ),
+        .mem_we_n                (mem_we_n       ),
+        .mem_odt                 (mem_odt        ),
+        .mem_a                   (mem_a          ),
+        .mem_ba                  (mem_ba         ),
+        .mem_dqs                 (mem_dqs        ),
+        .mem_dqs_n               (mem_dqs_n      ),
+        .mem_dq                  (mem_dq         ),
+        .mem_dm                  (mem_dm         ),
+
+        .debug_data              (               ),
+        .debug_slice_state       (               ),
+        .debug_calib_ctrl        (               ),
+        .ck_dly_set_bin          (               ),
+        .force_ck_dly_en         (1'b0           ),
+        .force_ck_dly_set_bin    (8'h05          ),
+        .dll_step                (               ),
+        .dll_lock                (               ),
+        .init_read_clk_ctrl      (2'b0           ),
+        .init_slip_step          (4'b0           ),
+        .force_read_clk_ctrl     (1'b0           ),
+        .ddrphy_gate_update_en   (1'b0           ),
+        .update_com_val_err_flag (               ),
+        .rd_fake_stop            (1'b0           )
+    );
+
+    //========================================================================
+    // fram_buf：乒乓帧缓存 + 三时钟域跨域（厂商原样）
+    //   接线与 hdmi_ddr_ov5640_top.v 一致，唯一区别：wr_data 换成自研图样。
+    //
+    //   `ifdef USE_SIM_BUF：仿真时用 fb_bram 顶替，以便在完全没有 DDR3
+    //   加密 IP 的情况下验证本顶层的逻辑（图样生成 + 逐像素校验 + LED）。
+    //   ⚠️ 仿真时 **不接** DDR3_50H 的 AXI（下面那段被 ifdef 掉），
+    //      所以它验证不了 DDR3 本身。PDS 综合时这个宏不存在，走的是真 fram_buf。
+    //========================================================================
+    wire fb_init_done;
+
+`ifdef USE_SIM_BUF
+    // ---------------- 仿真分支：单缓冲 BRAM 替身 ----------------
+    // 只接真实 fram_buf 接口里"纯逻辑相关"的那些信号，AXI 一律悬空。
+    fb_bram #(
+        .H_NUM     (H_NUM    ),
+        .V_NUM     (V_NUM    ),
+        .PIX_WIDTH (PIX_WIDTH)
+    ) u_fram_buf (
+        .vin_clk   (wr_vin_clk),
+        .wr_fsync  (wr_fsync_f),
+        .wr_en     (wr_de_f     ),
+        .wr_data   (wr_pixel_f  ),
+        .vout_clk  (pix_clk     ),
+        .rd_fsync  (rd_vs       ),
+        .rd_en     (rd_de_re    ),
+        .vout_de   (vout_de     ),
+        .vout_data (vout_data   ),
+        .init_done (fb_init_done),
+        .dbg_wr_ptr(             ),
+        .dbg_rd_ptr(             ),
+        .dbg_shadow(             )
+    );
+    // 仿真分支（USE_SIM_BUF）没有摄像头帧缓存：右半屏退回显示帧（整屏都是 HDMI）
+    wire        cam_vout_de;
+    wire [15:0] cam_vout_data;
+    assign cam_vout_de   = 1'b0;
+    assign cam_vout_data = 16'd0;
+`else
+    // ---------------- 综合分支：厂商三时钟域 fram_buf ----------------
+    //====================================================================
+    // fram_buf 的帧尺寸（2026-10-28 新增）
+    //
+    //   ★ 为什么不能直接用全局的 H_NUM/V_NUM（=1920x1080）：
+    //     wr_buf.v 里判断"这一行写完了"的条件是：
+    //         if(x_cnt > H_NUM - 5'd20 & wr_enable) rd_pulse <= 1'b1;
+    //     我们的摄像头是 1280 宽，x_cnt 最多到 1280，永远不 > 1900，
+    //     所以 rd_pulse 一次都不触发 -> 一个像素都没搬进 DDR3 -> 画面定格。
+    //   ★ 而读侧 sync_vg(u_rd_sync) 是硬编码 1920x1080 的显示时序，
+    //     所以这里只把【帧缓存本身】改成 1280x720，检测链的坐标系不变。
+    //     效果：摄像头画面会出现在屏幕左侧 2/3（1280/1920），后面是旧数据，
+    //     足以验证摄像头通路；之后再用 video_zoom.v 做 720p->1080p 缩放。
+    //====================================================================
+    localparam [11:0] FB_H_NUM = 12'd1920;   // 2026-10-28 改：1080P 合成行宽
+    localparam [11:0] FB_V_NUM = 12'd1080;   // v3：上下半屏都进 framebuf（整帧 1080 行）
+
+    // ★ 2026-10-30 晚：摄像头帧缓存改成【摄像头原生尺寸】，写侧 1:1。
+    //   旧值是 960x1080（写侧 3/4 抽稀 + 写侧 1.5 倍纵向拉伸），是花屏的根源之一。
+    //   现在就是 640x480（= CAM_SRC_W/CAM_SRC_H），拉伸全部由读侧 cam_line_rd 做。
+    localparam [11:0] CAM_FB_H_NUM = CAM_SRC_W;  // 帧缓存行宽 = 摄像头真实行宽
+    localparam [11:0] CAM_FB_V_NUM = CAM_SRC_H;  // 帧缓存行数 = 每帧真实行数
+
+    // 摄像头帧缓存的读窗口：现在由 cam_line_rd 自己按 rd_de/rd_x 判定（x=960..1919），
+    // 不再需要这里做 rd_de_re & (rd_x>=960) 的门控。
+    wire        cam_vout_de;
+    wire [15:0] cam_vout_data;
+
+    fram_buf_dual #(
+        .MEM_ROW_WIDTH    (MEM_ROW_ADDR_WIDTH),
+        .MEM_COLUMN_WIDTH (MEM_COL_ADDR_WIDTH),
+        .MEM_BANK_WIDTH   (MEM_BADDR_WIDTH   ),
+        .MEM_DQ_WIDTH     (MEM_DQ_WIDTH      ),
+        .H_NUM            (FB_H_NUM          ),
+        .V_NUM            (FB_V_NUM          ),
+        .CAM_H_NUM        (CAM_FB_H_NUM      ),
+        .CAM_V_NUM        (CAM_FB_V_NUM      ),
+        .CAM_ADDR_OFFSET  (28'h080_0000     ),   // 32MB 起：摄像头帧缓存
+        .PIX_WIDTH        (PIX_WIDTH         )
+    ) u_fram_buf (
+        .ddr_clk        (core_clk       ),
+        .ddr_rstn       (ddr_init_done  ),
+
+        .vin_clk        (wr_vin_clk),
+        .wr_fsync       (wr_fsync_f),
+        .wr_en          (wr_de_f        ),
+        .wr_data        (wr_pixel_f     ),
+
+        .vout_clk       (pix_clk        ),
+        .rd_fsync       (rd_vs          ),
+        .rd_en          (rd_de_re       ),
+        .vout_de        (vout_de        ),
+        .vout_data      (vout_data      ),
+        .init_done      (fb_init_done   ),
+
+        // ★ 2026-10-30 晚：摄像头写口跑摄像头自己的时钟（写侧 1:1 的前提）
+        .cam_vin_clk    (cam_pclk_16bit ),
+        .cam_fsync      (cam_wr_fsync   ),
+        .cam_en         (cam_wr_en      ),
+        .cam_data       (cam_wr_px      ),
+        // 摄像头读口：cam_line_rd 自己判定右半屏窗口，所以给它 rd_de + rd_x
+        .cam_rd_de      (rd_de          ),
+        .cam_rd_x       (rd_x           ),
+        .cam_vout_de    (cam_vout_de    ),
+        .cam_vout_data  (cam_vout_data  ),
+
+        .axi_awaddr     (axi_awaddr     ),
+        .axi_awid       (axi_awuser_id  ),
+        .axi_awlen      (axi_awlen      ),
+        .axi_awsize     (               ),
+        .axi_awburst    (               ),
+        .axi_awready    (axi_awready    ),
+        .axi_awvalid    (axi_awvalid    ),
+        .axi_wdata      (axi_wdata      ),
+        .axi_wstrb      (axi_wstrb      ),
+        .axi_wlast      (axi_wusero_last),
+        .axi_wvalid     (               ),
+        .axi_wready     (axi_wready     ),
+        .axi_bid        (4'd0           ),
+        .axi_araddr     (axi_araddr     ),
+        .axi_arid       (axi_aruser_id  ),
+        .axi_arlen      (axi_arlen      ),
+        .axi_arsize     (               ),
+        .axi_arburst    (               ),
+        .axi_arvalid    (axi_arvalid    ),
+        .axi_arready    (axi_arready    ),
+        .axi_rready     (               ),
+        .axi_rdata      (axi_rdata      ),
+        .axi_rvalid     (axi_rvalid     ),
+        .axi_rlast      (axi_rlast      ),
+        .axi_rid        (axi_rid        )
+    );
+`endif
+
+    //========================================================================
+    // 逐像素校验：读回的像素是否等于"写侧图样函数在该行列的值"
+    //
+    //   关键：期望值用与写侧**完全相同的公式**重算，不存第二份。
+    //   ⚠️ 两个 x_act/y_act 来自各自的 sync_vg。只要 H_ACT/V_ACT/H_TOTAL/V_TOTAL
+    //      参数一致，同一个有效像素的坐标就一致，比对才成立。
+    //========================================================================
+    wire [15:0] pixel_expected = {rd_y[3:0], rd_x[7:0], rd_y[7:4]};
+
+    reg        verify_ok;         // 粘滞：收到过完整帧 且 无坏像素
+    reg        frame_had_error;   // 当前帧是否出现过坏像素
+    reg [31:0] ok_frames;
+    reg [31:0] bad_frames;
+    reg [31:0] err_pixels;        // 坏像素累计数（调试用）
+    reg        rd_active_tgl;     // 读侧活动指示（闪烁）
+    reg        rd_vs_d;           // rd_vs 打一拍，用于上升沿检测
+
+    always @(posedge pix_clk) begin
+        if (!fb_init_done) begin
+            verify_ok        <= 1'b0;
+            frame_had_error  <= 1'b0;
+            ok_frames        <= 32'd0;
+            bad_frames       <= 32'd0;
+            err_pixels       <= 32'd0;
+            rd_active_tgl    <= 1'b0;
+            rd_vs_d          <= 1'b0;
+        end else begin
+            rd_vs_d <= rd_vs;
+
+            // 读侧活动：有 de 就把翻转标志取反（会以很高频率翻转，
+            // 但 LED 是给人看的，实际会看到"亮"；这里只作"有活动"指示）
+            if (vout_de) rd_active_tgl <= ~rd_active_tgl;
+
+            // 逐像素比对
+            if (vout_de && (vout_data !== pixel_expected)) begin
+                frame_had_error <= 1'b1;
+                if (err_pixels != 32'hFFFFFFFF) err_pixels <= err_pixels + 32'd1;
+            end
+
+            // 帧边界结算（用读侧 vs 的上升沿）
+            if (rd_vs && !rd_vs_d) begin
+                if (frame_had_error) begin
+                    // 这一帧有坏像素：判为坏帧，并把粘滞的通过标志清掉
+                    if (bad_frames != 32'hFFFFFFFF) bad_frames <= bad_frames + 32'd1;
+                    verify_ok       <= 1'b0;
+                    frame_had_error <= 1'b0;
+                end else begin
+                    // 这一帧全对
+                    if (ok_frames != 32'hFFFFFFFF) ok_frames <= ok_frames + 32'd1;
+                    verify_ok <= 1'b1;
+                end
+            end
+        end
+    end
+
+    //========================================================================
+    // AXI 带宽计数器（用 Fabric Debugger 抓，算实际 DDR3 占用率）
+    //   算带宽： (wr_beats + rd_beats) * 32B / 采样秒数
+    //   32B = AXI 256bit 一拍；burst 长度由 axi_*len 决定，这里只数拍数。
+    //========================================================================
+    reg [31:0] wr_beats /* synthesis PAP_MARK_DEBUG="1" */;
+    reg [31:0] rd_beats /* synthesis PAP_MARK_DEBUG="1" */;
+
+    always @(posedge core_clk) begin
+        if (!ddr_init_done) begin
+            wr_beats <= 32'd0;
+            rd_beats <= 32'd0;
+        end else begin
+            if (axi_awvalid && axi_awready) wr_beats <= wr_beats + 32'd1;
+            if (axi_arvalid && axi_arready) rd_beats <= rd_beats + 32'd1;
+        end
+    end
+
+    //========================================================================
+    // ★ 图像处理路径（2026-10-18 新增）：灰度化 + 3x3 块平均降采样 + x3 放大
+    //
+    //   数据流：
+    //     fram_buf.vout_data (RGB565, 1080p)
+    //          │
+    //          ├──────────────────────────────────────────► 原图路径（PROC_MODE=0）
+    //          │
+    //          └──► gray_scale3x ──► 640x360 灰度 ──► x3 放大 ──► 1080p 灰度
+    //                                                          （PROC_MODE=1）
+    //
+    //   gray_scale3x 的内部是 scaler.v（**已上板验证过的那份**）：
+    //     灰度化（移位相加）→ 3 行缓冲 → 3x3 块平均 → /9 → 640x360
+    //   然后 magnifier 用 640x8 乒乓行缓冲把它 x3 放大回 1080p。
+    //
+    //   ⚠️ 为什么要 x3 放大回来：HDMI 输出格式必须是 1080p60（1920x1080），
+    //      不能直接输出 640x360，否则显示器锁不上。
+    //
+    //   验证方法：按一下模式键，画面上应该从
+    //     "彩色细条纹 + 15 条竖直色带" 变成 "黑白、且能看到明显的 3x3 方块感"
+    //========================================================================
+
+    //------------------------------------------------------------------------
+    // ★ 按键（2026-10-20 改：两个键各管一件事）
+    //
+    //   之前是"任一个键都翻转 proc_sel"，现在拆开：
+    //     K18 (key)   -> 循环 lane_sel：0=左转 → 1=直行 → 2=右转
+    //                    箭头跟着变（验收点 #7 的"转向指示"）
+    //     H17 (rst_n) -> 切换 proc_sel：彩色 / 灰度（保留原来的对比演示）
+    //
+    //   ⚠️ 两个都低有效、都加上拉（见 .fdc）。消抖都放 pix_clk 域。
+    //------------------------------------------------------------------------
+    wire [0:0] key_deb, key2_deb;
+
+    btn_deb_fix #(
+        .BTN_WIDTH (1         ),
+        .BTN_DELAY (20'hF_FFFF)          // @148MHz 约 7ms
+    ) u_deb_k1 (
+        .clk         (pix_clk ),
+        .btn_in      (key     ),         // K18
+        .btn_deb_fix (key_deb )
+    );
+
+    btn_deb_fix #(
+        .BTN_WIDTH (1         ),
+        .BTN_DELAY (20'hF_FFFF)
+    ) u_deb_k2 (
+        .clk         (pix_clk ),
+        .btn_in      (rst_n   ),         // H17
+        .btn_deb_fix (key2_deb)
+    );
+
+    wire key_pressed  = ~key_deb[0];     // K18 按下 = 1
+    wire key2_pressed = ~key2_deb[0];    // H17 按下 = 1
+
+    //------------------------------------------------------------------------
+    // ⚠️ 上电误触发防护（这个坑很隐蔽，记一笔）
+    //
+    //   btn_deb_fix **没有复位端**，它的输出寄存器上电值是 0
+    //   -> key_deb[0] = 0  -> key_pressed = 1  -> 看起来像"按键一直是按下的"
+    //   -> 如果不加防护，上电第一拍就会检测到一个假上升沿，把 proc_sel 翻反。
+    //
+    //   防护：上电后先等 DEB_SETTLE 拍（约 7ms，和消抖计数一样长），
+    //   这段时间内只跟踪 key_d、不判边沿；窗口结束后 key_d 已经等于真实值，
+    //   后面再检测到的边沿就都是真的按键动作了。
+    //------------------------------------------------------------------------
+    reg [19:0] por_cnt;
+    wire       deb_ready = (por_cnt == 20'hF_FFFF);
+
+    reg  key_d, key2_d;
+    // ★ 2026-10-20：显示模式 1 位 -> 2 位三态（原图 / 灰度 / 2x2四宫格）
+    reg  [1:0] lane_sel;                 // 0=左转 1=直行 2=右转（箭头跟着变）
+
+    always @(posedge pix_clk or negedge fb_init_done) begin
+        if (!fb_init_done) begin
+            por_cnt   <= 20'd0;
+            key_d     <= 1'b0;
+            key2_d    <= 1'b0;
+            disp_mode <= {1'b0, 1'b0, PROC_MODE};   // [2]=0 用合成场景
+            lane_sel  <= 2'd1;                // 上电默认"直行"
+        end else begin
+            if (!deb_ready)
+                por_cnt <= por_cnt + 20'd1;
+
+            key_d  <= key_pressed;
+            key2_d <= key2_pressed;
+
+            // K18：循环 左转 -> 直行 -> 右转 -> 左转 ...
+            if (deb_ready && key_pressed & ~key_d)
+                lane_sel <= (lane_sel == 2'd2) ? 2'd0 : lane_sel + 2'd1;
+
+            // H17：循环显示模式 原图 -> 灰度 -> 2x2四宫格 -> 原图 ...
+            if (deb_ready && key2_pressed & ~key2_d)
+                disp_mode <= (disp_mode == 3'd7) ? 3'd0 : disp_mode + 3'd1;
+        end
+    end
+
+    //========================================================================
+    // ★ 车道线检测链（2026-10-20 新增，来自 detect_chain 工程，作者人2）
+    //
+    //   全部在 pix_clk 域，**与显示路径并行**（互不影响）：
+    //
+    //     vout_data (RGB565)
+    //        └─► rgb2gray ──► gauss3x3 ──► binarize ──► lane_detect ──► ctrl_fsm
+    //              │            │            │             │              │
+    //           8 位灰度     平滑+坐标     1 位二值    实线/虚线/无    箭头+报警
+    //
+    //   ★ 坐标 xc/yc 由 gauss3x3 自动产生（o_xc/o_yc），**不需要额外计数器**。
+    //   ★ i_floor 固定 8'd0、i_floor_we 固定 0（与原作者在 detect_chain_glue、
+    //     lane_detect_top 里的接法完全一致）。
+    //   ★ lane_detect 的 ROI = y 592~1079、MID_X=960、WIN=1024，
+    //     正好覆盖 scene_gen 画的两条斜车道线（左 700~822、右 1099~1220）。
+    //
+    //   本工程**只接车道线这一路**：
+    //     zebra_detect / frame_diff_ccl / traffic_light 由另一位队员负责，
+    //     所以 ctrl_fsm 的 i_zebra/i_obstacle 固定 0、i_tl 固定 2（绿灯）。
+    //========================================================================
+
+    // ---- 1) RGB565 -> 8 位灰度 ----
+    wire        rgbg_de, rgbg_hs, rgbg_vs;
+    wire [7:0]  rgbg_gray;
+
+    rgb2gray #(
+        .IN_FMT (0)                      // 0 = RGB565
+    ) u_rgb2gray (
+        .clk    (pix_clk     ),
+        .rst_n  (fb_init_done),
+        .i_de   (vout_de     ),
+        .i_hs   (rd_hs       ),
+        .i_vs   (rd_vs       ),
+        .i_data ({8'd0, vout_data}),
+        .o_de   (rgbg_de     ),
+        .o_hs   (rgbg_hs     ),
+        .o_vs   (rgbg_vs     ),
+        .o_gray (rgbg_gray   )
+    );
+
+    // ---- 2) 3x3 高斯平滑 + 产生像素坐标 ----
+    wire        gau_de, gau_hs, gau_vs;
+    wire [7:0]  gau_gray;
+    wire [11:0] gau_xc, gau_yc;
+
+    gauss3x3 #(
+        .H_ACT (H_NUM),
+        .V_ACT (V_NUM),
+        .AW    (11   )
+    ) u_gauss (
+        .clk    (pix_clk     ),
+        .rst_n  (fb_init_done),
+        .i_de   (rgbg_de     ),
+        .i_hs   (rgbg_hs     ),
+        .i_vs   (rgbg_vs     ),
+        .i_gray (rgbg_gray   ),
+        .o_de   (gau_de      ),
+        .o_hs   (gau_hs      ),
+        .o_vs   (gau_vs      ),
+        .o_gray (gau_gray    ),
+        .o_xc   (gau_xc      ),
+        .o_yc   (gau_yc      )
+    );
+
+    // ---- 3) 逐像素自适应二值化 ----
+    wire        bin_de, bin_hs, bin_vs, bin_bit;
+    wire [11:0] bin_xc, bin_yc;
+    wire [7:0]  bin_level;
+
+    binarize #(
+        .H_ACT  (H_NUM   ),
+        .ROI_Y0 (12'd0   ),
+        .ROI_Y1 (12'd719 )
+    ) u_binarize (
+        .clk        (pix_clk     ),
+        .rst_n      (fb_init_done),
+        .i_de       (gau_de      ),
+        .i_hs       (gau_hs      ),
+        .i_vs       (gau_vs      ),
+        .i_gray     (gau_gray    ),
+        .i_xc       (gau_xc      ),
+        .i_yc       (gau_yc      ),
+        .i_floor    (8'd0        ),
+        .i_floor_we (1'b0        ),
+        .o_de       (bin_de      ),
+        .o_hs       (bin_hs      ),
+        .o_vs       (bin_vs      ),
+        .o_bin      (bin_bit     ),
+        .o_xc       (bin_xc      ),
+        .o_yc       (bin_yc      ),
+        .o_level    (bin_level   )
+    );
+
+    // ---- 4) 车道线检测（左右线类型 + 位置）----
+    wire        lane_vld;
+    wire [1:0]  lane_type_l, lane_type_r;
+    wire [11:0] lane_pos_l,  lane_pos_r;
+
+    lane_detect u_lane (
+        .clk      (pix_clk     ),
+        .rst_n    (fb_init_done),
+        .i_de     (bin_de      ),
+        .i_hs     (bin_hs      ),
+        .i_vs     (bin_vs      ),
+        .i_bin    (bin_bit     ),
+        .i_xc     (bin_xc      ),
+        .i_yc     (bin_yc      ),
+        .o_type_l (lane_type_l ),
+        .o_type_r (lane_type_r ),
+        .o_valid  (lane_vld    ),
+        .o_pos_l  (lane_pos_l  ),
+        .o_pos_r  (lane_pos_r  )
+    );
+
+    // ---- 5) 决策状态机 -> 箭头 / 车道 LED / 报警 ----
+    //   ★ rd_vs_d 在文件前面"逐像素校验"段的 always 块里已经在驱动了
+    //     （L579/L581），所以这里**只能声明，不能再写第二个 always**，
+    //     否则 PDS 报 Verilog-4086 "More than one always block assigned..."。
+    wire rd_fv = rd_vs & ~rd_vs_d;       // 帧起始脉冲
+
+    wire [1:0] fsm_lane, fsm_tl, fsm_line;
+    wire       fsm_motion, fsm_alarm;
+    wire [2:0] fsm_led_lane;
+    wire [1:0] fsm_arrow;
+
+    //========================================================================
+    // ★ 真实红绿灯检测（2026-10-24 新增，验收点 #7 从"合成灯"升级为"检测灯"）
+    //
+    //   之前 ctrl_fsm.i_tl 接的是 scene_gen 自己生成的 tl_color（合成灯，不是检测）。
+    //   现在接 traffic_light.v 的真检测（颜色阈值 + 面积 + 最小外接框 + 5 帧一致）。
+    //
+    //   ⚠️ 坐标对齐：vout_data 相对 rd_x/rd_y 有 fram_buf 的流水线延迟，
+    //      不能直接用 rd_x/rd_y。这里从 vout_de 自己数一个坐标计数器，
+    //      和数据同源，天然对齐。
+    //
+    //   ROI 覆盖两个场景的红绿灯：
+    //     合成场景：x 900~1020, y 120~300
+    //     真实道路：x 610~1020, y 355~430（240x135 放大 8 倍后）
+    //     -> 统一取 X 600~1100, Y 100~460
+    //
+    //   o_state 编码：0=红 1=黄 2=绿 3=未知 —— 和 tl_color 完全一致，可直接接。
+    //   未知(3) 时按绿灯处理（安全默认），避免状态机误停在停车态。
+    //========================================================================
+    reg [11:0] tlx_cnt, tly_cnt;
+    reg        vout_de_d;
+    wire       tlde_fall = vout_de_d & ~vout_de;
+
+    always @(posedge pix_clk or negedge fb_init_done) begin
+        if (!fb_init_done) begin
+            tlx_cnt   <= 12'd0;
+            tly_cnt   <= 12'd0;
+            vout_de_d <= 1'b0;
+        end else begin
+            vout_de_d <= vout_de;
+            if (vout_de)                tlx_cnt <= tlx_cnt + 12'd1;
+            else                        tlx_cnt <= 12'd0;
+            if (tlde_fall)              tly_cnt <= tly_cnt + 12'd1;
+            if (rd_vs && !rd_vs_d)      tly_cnt <= 0;
+        end
+    end
+
+    wire [1:0]  tl_det_state;
+    wire        tl_det_valid;
+    wire [17:0] tl_det_area, tl_det_box;
+
+    traffic_light #(
+        .ROI_X0   (12'd600 ),
+        .ROI_X1   (12'd1100),
+        .ROI_Y0   (12'd100 ),
+        .ROI_Y1   (12'd460 ),
+        .MIN_AREA (18'd20  )
+    ) u_traffic_light (
+        .clk     (pix_clk      ),
+        .rst_n   (fb_init_done ),
+        .i_de    (vout_de      ),
+        .i_hs    (rd_hs        ),
+        .i_vs    (rd_vs        ),
+        .i_rgb   (vout_data    ),
+        .i_xc    (tlx_cnt      ),
+        .i_yc    (tly_cnt      ),
+        .o_state (tl_det_state ),
+        .o_valid (tl_det_valid ),
+        .o_area  (tl_det_area  ),
+        .o_box   (tl_det_box   )
+    );
+
+    // 未知(3) -> 按绿灯处理，避免状态机误停
+    wire [1:0] tl_for_fsm = (tl_det_state == 2'd3) ? 2'd2 : tl_det_state;
+
+    ctrl_fsm u_fsm (
+        .clk         (pix_clk     ),
+        .rst_n       (fb_init_done),
+        .i_fv        (rd_fv       ),
+        .i_lane_sel  (lane_sel    ),
+        .i_line_type (line_type_fsm),     // 重映射后的线型编码（见上方说明）
+        .i_tl        (tl_for_fsm  ),     // ★ 接【真实检测】结果（2026-10-24 升级）
+        .i_zebra     (1'b0        ),     // 不接斑马线探测器
+        .i_obstacle  (1'b0        ),     // 不接障碍探测器
+        .o_lane      (fsm_lane    ),
+        .o_arrow     (fsm_arrow   ),
+        .o_led_lane  (fsm_led_lane),
+        .o_motion    (fsm_motion  ),
+        .o_tl        (fsm_tl      ),
+        .o_line_type (fsm_line    ),
+        .o_alarm     (fsm_alarm   )
+    );
+
+    wire        gs_de, gs_hs, gs_vs;
+    wire [7:0]  gs_gray;
+
+    gray_scale3x #(
+        .IN_FMT (0        ),   // 0 = RGB565（fram_buf 输出就是 16 位）
+        .H_ACT  (H_NUM    ),
+        .V_ACT  (V_NUM    )
+    ) u_gray (
+        .clk    (pix_clk     ),
+        .rst_n  (fb_init_done),
+        .i_de   (vout_de     ),
+        .i_hs   (rd_hs       ),
+        .i_vs   (rd_vs       ),
+        .i_data ({8'd0, vout_data}),   // RGB565 放低 16 位
+        .o_de   (gs_de       ),
+        .o_hs   (gs_hs       ),
+        .o_vs   (gs_vs       ),
+        .o_gray (gs_gray     )
+    );
+
+    //========================================================================
+    // HDMI 视频输出接线
+    //
+    //   像素格式：vout_data 是 RGB565 { R[4:0], G[5:0], B[4:0] }
+    //   MS7210 要 RGB888，做"高位复制"扩展：
+    //     R8 = {R5, R5[4:2]}   （低 3 位用 5 位里的高 3 位补）
+    //     G8 = {G6, G6[5:4]}   （低 2 位用 6 位里的高 2 位补）
+    //     B8 = {B5, B5[4:2]}
+    //   这样满量程仍是 255，不会出现"最亮只到 248"的偏暗。
+    //
+    //   ⚠️ 原图路径的 de 用 vout_de（与 vout_data 同源、严格对齐）；
+    //      hs/vs 用读侧 sync_vg 的输出。两者可能有 1~2 拍偏斜，
+    //      表现为画面水平方向轻微平移几个像素，不影响判断。
+    //      灰度路径的 de/hs/vs 都来自 gray_scale3x，三者严格对齐。
+    //========================================================================
+    //========================================================================
+    // ★ OSD 叠加（2026-10-18 新增）
+    //
+    //   先做一个"统一的 RGB888 视频流"（由 proc_sel 选择原图还是灰度），
+    //   然后交给 osd_overlay 叠加图形，最后送到引脚。
+    //
+    //   为什么用统一流：这样 OSD 对两种模式都生效，
+    //   按模式键切换彩色/黑白时，箭头和框**始终都在**，演示更连贯。
+    //
+    //   osd_overlay / osd_alpha_mix 是从 osd 工程直接搬过来的
+    //   （那两个工程都已上板验证过：alpha 淡入淡出 + 3 朝向箭头轮换）。
+    //   本处只把 4 个"运行时输入"接成固定值 + 一个自动轮换的箭头朝向。
+    //
+    //   延迟：osd_alpha_mix 固定 3 拍，osd_overlay 的 o_de/o_hs/o_vs
+    //         已经和 o_rgb 对齐，所以直接替代原来的 de/hs/vs 即可。
+    //========================================================================
+
+    //========================================================================
+    // ★ 2x2 四宫格拼接（2026-10-20 新增，验收点"多画面拼接"）
+    //
+    //   四格内容（**全部从 vout_data 组合派生，同一拍，零延迟差**）：
+    //     Q0 左上：彩色原图
+    //     Q1 右上：灰度（BT.601 77/150/29，全用移位加法，不占 DSP）
+    //     Q2 左下：二值化（固定阈值 128，仅作显示示意）
+    //     Q3 右下：反色
+    //
+    //   ⚠️ 为什么全用组合派生：
+    //     我们链路上的 gs_gray（3x3降采样）、bin_bit（高斯+二值）都有
+    //     多行流水线延迟，直接和 vout_data 混用会在格子边界出现画面错位。
+    //     从同一个 vout_data 组合派生 4 种效果就完全对齐了，
+    //     代价是 Q2 用的是固定阈值（不是检测链那套自适应阈值）。
+    //     真正"四路摄像头拼接"需要 fram_buf 支持 4 个写口，属于后续工作。
+    //
+    //   象限由 rd_x/rd_y（读侧 sync_vg 的坐标）决定，quad_mux 纯组合选择。
+    //========================================================================
+
+    // ★ v2：上半屏取 HDMI 行缓存，下半屏取摄像头帧缓存
+    // ★ 版本二：左半取显示帧缓存，右半取摄像头帧缓存（按读侧坐标逐像素选通）
+    wire [15:0] cam_disp_pix = cam_vout_de ? cam_vout_data : vout_data;
+
+    wire [15:0] disp_pix = cam_disp_pix;
+    wire [4:0] src_r5 = disp_pix[15:11];
+    wire [5:0] src_g6 = disp_pix[10:5];
+    wire [4:0] src_b5 = disp_pix[4:0];
+
+    // 组合彩色（RGB565 高位复制扩展到 888）
+    wire [7:0] q_r8 = {src_r5, src_r5[4:2]};
+    wire [7:0] q_g8 = {src_g6, src_g6[5:4]};
+    wire [7:0] q_b8 = {src_b5, src_b5[4:2]};
+    wire [23:0] q_color = {q_r8, q_g8, q_b8};
+
+    // 组合灰度：77R + 150G + 29B，全部用移位加法
+    wire [15:0] q_gw = ( ({8'd0,q_r8} << 6) + ({8'd0,q_r8} << 3) + ({8'd0,q_r8} << 2) + {8'd0,q_r8} )
+                     + ( ({8'd0,q_g8} << 7) + ({8'd0,q_g8} << 4) + ({8'd0,q_g8} << 2) + ({8'd0,q_g8} << 1) )
+                     + ( ({8'd0,q_b8} << 5) - ({8'd0,q_b8} << 2) + {8'd0,q_b8} );
+    wire [7:0]  q_gray = q_gw[15:8];
+    wire [23:0] q_grey = {q_gray, q_gray, q_gray};
+
+    // 组合二值化（固定阈值 128）—— 白/黑
+    wire [23:0] q_bin = (q_gray >= 8'd128) ? 24'hFFFFFF : 24'h000000;
+
+    // 反色
+    wire [23:0] q_inv = ~q_color;
+
+    // 四宫格选择
+    wire        quad_de, quad_hs, quad_vs;
+    wire [23:0] quad_rgb;
+    wire [1:0]  quad_id;
+
+    quad_mux #(
+        .H_ACT (H_NUM),
+        .V_ACT (V_NUM)
+    ) u_quad (
+        .i_de   (rd_de   ),   // ★ 必须用完整显示 DE，不能用被门控的 vout_de
+        .i_hs   (rd_hs   ),
+        .i_vs   (rd_vs   ),
+        .i_x    (rd_x    ),
+        .i_y    (rd_y    ),
+        .s0_rgb (q_color ),
+        .s1_rgb (q_grey  ),
+        .s2_rgb (q_bin   ),
+        .s3_rgb (q_inv   ),
+        .o_de   (quad_de ),
+        .o_hs   (quad_hs ),
+        .o_vs   (quad_vs ),
+        .o_rgb  (quad_rgb),
+        .o_quad (quad_id )
+    );
+
+    //========================================================================
+    // ★ USB-UART 调试打印（2026-10-24 新增）
+    //
+    //   每 250ms 打印 8 行，PC 上串口助手（115200 8N1）直接看：
+    //     F<8位hex>  帧计数
+    //     L<8位hex>  左侧车道线类型  0=无 1=实线 2=虚线
+    //     R<8位hex>  右侧车道线类型
+    //     S<8位hex>  车道选择        0=左 1=直 2=右
+    //     M<8位hex>  行驶状态        1=行驶 0=停止
+    //     A<8位hex>  报警 bit0
+    //     T<8位hex>  红绿灯          0=红 1=黄 2=绿
+    //     X<8位hex>  DDR3 读侧活动计数（观察链路是否在跑）
+    //
+    //   ⚠️ 引脚约束是 1.2V / LVCMOS12，不能写 3.3V。
+    //========================================================================
+    reg [31:0] dbg_frame_cnt;
+    wire       dbg_vs_rise = rd_vs & ~rd_vs_d;
+    always @(posedge pix_clk or negedge fb_init_done) begin
+        if (!fb_init_done) dbg_frame_cnt <= 32'd0;
+        else if (dbg_vs_rise) dbg_frame_cnt <= dbg_frame_cnt + 32'd1;
+    end
+
+    // 读侧活动计数：每收到一个有效像素 +1（用来确认显示链路在跑）
+    reg [31:0] dbg_pix_cnt;
+    always @(posedge pix_clk or negedge fb_init_done) begin
+        if (!fb_init_done) dbg_pix_cnt <= 32'd0;
+        else if (vout_de)  dbg_pix_cnt <= dbg_pix_cnt + 32'd1;
+    end
+
+    wire        uart_busy;
+    wire        uart_valid;
+    wire [7:0]  uart_data;
+
+    uart_tx #(.CLK_HZ(50_000_000), .BAUD(115200)) u_uart_tx (
+        .clk     (sys_clk   ),
+        .rst_n   (rstn_out  ),
+        .i_valid (uart_valid),
+        .i_data  (uart_data ),
+        .o_tx    (uart_txd  ),
+        .o_busy  (uart_busy )
+    );
+
+    //====================================================================
+    // 摄像头诊断打包（2026-10-28 新增，通过串口 X 字段输出）
+    //
+    //   ★ 为什么这么做：不切 SRC_CAM（画面保持正常），只把摄像头的
+    //     原始信号抓成计数器打到串口。这样能定性判断摄像头是死是活，
+    //     又不会影响已经正常的 HDMI 显示。
+    //
+    //   X 字段 32 位含义（十六进制，从高到低）：
+    //     [31:16] cam_pclk_cnt[15:0]  摄像头 PCLK 计数（每 250ms 应该增加）
+    //     [15:8]  cam_data_or         8 位数据线"曾经为 1"的按位或
+    //                                  非 0 = 数据线有信号；全 0 = 数据线全黑/没接
+    //     [7]     cam_init_done       I2C 配置完成（注意：不检查 ACK，不一定可信）
+    //     [6]     cam_vs_seen         见过 VSYNC 跳变（= 有帧同步）
+    //     [5]     cam_href_seen       见过 HREF 高电平（= 有行有效窗口）
+    //     [4]     cam_nack_many       NACK > 100（= 摄像头完全不应答 I2C）
+    //     [3:0]   保留 0
+    //
+    //   判读表：
+    //     X = 0000_0000  -> 摄像头完全没工作（无时钟、无数据）
+    //     [31:16] 在变    -> PCLK 在跳，摄像头在出时钟
+    //     [15:8] != 00    -> 数据线有信号
+    //     [6][5] != 0     -> 帧/行同步正常
+    //     [4] = 1         -> I2C 完全无应答（硬件/接线问题）
+    //====================================================================
+    reg [23:0] cam_pclk_cnt;
+    always @(posedge cmos1_pclk) cam_pclk_cnt <= cam_pclk_cnt + 24'd1;
+
+    wire cam_nack_many = (cam_nack_cnt > 16'd100);
+    wire [15:0] mosaic_de_cycles_dummy = 16'd0;
+
+    wire [31:0] dbg_cam = {
+        16'd0,                    // [31:16] 预留
+        q_srcw1                   // [15:0]  cam1 实测行宽
+    };
+
+    dbg_print #(.CLK_HZ(50_000_000), .REFRESH_CYC(12_500_000)) u_dbg_print (
+        .clk     (sys_clk   ),
+        .rst_n   (rstn_out  ),
+        .i_v0    (dbg_frame_cnt              ),
+        .i_v1    ({30'd0, lane_type_l}       ),
+        .i_v2    ({30'd0, lane_type_r}       ),
+        .i_v3    ({30'd0, lane_sel}          ),
+        .i_v4    ({31'd0, fsm_motion}        ),
+        .i_v5    ({31'd0, fsm_alarm}         ),
+        .i_v6    ({16'd0, q_camlines}    ),   // ★ T = 摄像头每帧到达行数
+        .i_v7    ({4'd0, cam_lines_dbg} ),   // ★ X = 摄像头上一帧真实行数（帧末锁存；1:1 写后应≈480，不是 1080）
+        .o_valid (uart_valid),
+        .o_data  (uart_data ),
+        .i_busy  (uart_busy )
+    );
+
+    //========================================================================
+    //========================================================================
+    // ★ HDMI 输入状态采集 + 调试显示屏（2026-10-21 新增）
+    //
+    //   目的：不再靠 4 个 LED 猜，直接把状态画到 HDMI 显示器上。
+    //
+    //   画面：8 条竖色带，每条 256 像素宽（1920/8 -> 用 rd_x[11:8]）
+    //         **绿色 = 1，红色 = 0**，带间留 1 像素黑缝
+    //   从左到右：
+    //     col0 : init_over_rx   MS7200 I2C 配置完成
+    //     col1 : hdmi_locked    厂商 monitor 锁定（连续4帧一致 + VS 按时到）
+    //     col2 : hdmi_size_ok   实测分辨率 == 1920x1080
+    //     col3 : pixclk >= 100MHz
+    //     col4 : HS 每秒 >= 1000 个边沿
+    //     col5 : HS 每秒 >= 30000 个边沿（行频量级）
+    //     col6 : VS 每秒 >= 30 个边沿
+    //     col7 : DE 有跳变（非恒定电平）
+    //========================================================================
+
+    // ---- 厂商 monitor（必须先声明原始信号）----
+    // ---- 四种极性组合的 monitor（2026-10-23）----
+    //   信号都在动但锁不上 -> 最可能是 DE/VS 极性反了。
+    //   同时跑 4 个组合，看哪一个能锁上：
+    //     A: vs 高有效 / de 高有效
+    //     B: vs 高有效 / de 低有效
+    //     C: vs 低有效 / de 高有效
+    //     D: vs 低有效 / de 低有效
+    wire        m_a_lock, m_b_lock, m_c_lock, m_d_lock;
+    wire        m_a_size, m_b_size, m_c_size, m_d_size;
+    wire [11:0] m_a_rx, m_a_ry, m_b_rx, m_b_ry;
+    wire [11:0] m_c_rx, m_c_ry, m_d_rx, m_d_ry;
+
+    video_monitor #(.H_ACT_EXP(12'd1920), .V_ACT_EXP(12'd1080),
+                    .LOCK_FRAMES(4'd4), .VS_TIMEOUT(32'd4_000_000))
+    u_mon_a (.clk(pixclk_in), .rst_n(rstn_out), .en(1'b1),
+             .vs(vs_in), .de(de_in),
+             .o_locked(m_a_lock), .o_res_x(m_a_rx), .o_res_y(m_a_ry),
+             .o_size_ok(m_a_size), .o_frame_cnt(), .o_vs_rise());
+
+    video_monitor #(.H_ACT_EXP(12'd1920), .V_ACT_EXP(12'd1080),
+                    .LOCK_FRAMES(4'd4), .VS_TIMEOUT(32'd4_000_000))
+    u_mon_b (.clk(pixclk_in), .rst_n(rstn_out), .en(1'b1),
+             .vs(vs_in), .de(~de_in),
+             .o_locked(m_b_lock), .o_res_x(m_b_rx), .o_res_y(m_b_ry),
+             .o_size_ok(m_b_size), .o_frame_cnt(), .o_vs_rise());
+
+    video_monitor #(.H_ACT_EXP(12'd1920), .V_ACT_EXP(12'd1080),
+                    .LOCK_FRAMES(4'd4), .VS_TIMEOUT(32'd4_000_000))
+    u_mon_c (.clk(pixclk_in), .rst_n(rstn_out), .en(1'b1),
+             .vs(~vs_in), .de(de_in),
+             .o_locked(m_c_lock), .o_res_x(m_c_rx), .o_res_y(m_c_ry),
+             .o_size_ok(m_c_size), .o_frame_cnt(), .o_vs_rise());
+
+    video_monitor #(.H_ACT_EXP(12'd1920), .V_ACT_EXP(12'd1080),
+                    .LOCK_FRAMES(4'd4), .VS_TIMEOUT(32'd4_000_000))
+    u_mon_d (.clk(pixclk_in), .rst_n(rstn_out), .en(1'b1),
+             .vs(~vs_in), .de(~de_in),
+             .o_locked(m_d_lock), .o_res_x(m_d_rx), .o_res_y(m_d_ry),
+             .o_size_ok(m_d_size), .o_frame_cnt(), .o_vs_rise());
+
+    // 哪个组合锁上了就用它的测量值（优先级 A>B>C>D）
+    wire        hdmi_locked_raw = m_a_lock | m_b_lock | m_c_lock | m_d_lock;
+    wire        hdmi_size_raw   = m_a_size | m_b_size | m_c_size | m_d_size;
+    wire [11:0] hdmi_rx = m_a_lock ? m_a_rx : m_b_lock ? m_b_rx :
+                          m_c_lock ? m_c_rx : m_d_rx;
+    wire [11:0] hdmi_ry = m_a_lock ? m_a_ry : m_b_lock ? m_b_ry :
+                          m_c_lock ? m_c_ry : m_d_ry;
+
+    // ---- pixclk_in 域的同步（状态位是慢变量，2 级同步足够）----
+    reg [2:0] in_lk_s, in_sz_s, in_de_s, in_vs_s, in_hs_s;
+    always @(posedge pixclk_in or negedge rstn_out) begin
+        if (!rstn_out) begin
+            in_lk_s <= 3'd0; in_sz_s <= 3'd0;
+            in_de_s <= 3'd0; in_vs_s <= 3'd0; in_hs_s <= 3'd0;
+        end else begin
+            in_lk_s <= {in_lk_s[1:0], hdmi_locked_raw};
+            in_sz_s <= {in_sz_s[1:0], hdmi_size_raw  };
+            in_de_s <= {in_de_s[1:0], de_in          };
+            in_vs_s <= {in_vs_s[1:0], vs_in          };
+            in_hs_s <= {in_hs_s[1:0], hs_in          };
+        end
+    end
+
+    // ---- pixclk 自由计数器（测频率）----
+    reg [31:0] in_pc_cnt;
+    always @(posedge pixclk_in or negedge rstn_out) begin
+        if (!rstn_out) in_pc_cnt <= 32'd0;
+        else           in_pc_cnt <= in_pc_cnt + 32'd1;
+    end
+
+    // ---- 1 秒窗口统计 + KEY1 快照（sys_clk 域）----
+    //
+    //   ★ 2026-10-21 晚 修正：原来画面一直在跳，根本看不清。原因有两个：
+    //     ① 用 sys_clk 去读 148.5MHz 域的 32 位计数器 -> 每一位都可能亚稳态，频率值是噪声
+    //     ② 每秒自动更新 -> 拍照时刚好抓在变化瞬间
+    //   现在改成：
+    //     · pixclk 只检测低 4 位有没有变化（1 位级跨域，安全）
+    //     · 测量值先进入 live，**按 KEY1 才冻结到 hold**，画面就定住了
+    //     · 上电 3 秒后自动快照一次，保证不按键也有初始显示
+    reg [25:0] dbg_win;
+    reg [19:0] in_hs_num, in_vs_num;
+    reg        in_de_tgl;
+    reg [3:0]  pc_low_d;
+    reg        pc_act;
+
+    reg [19:0] live_hs, live_vs;
+    reg        live_detgl, live_pcact;
+
+    reg [19:0] hold_hs, hold_vs;
+    reg        hold_detgl, hold_pcact;
+    reg        hold_lk, hold_sz, hold_init;
+    reg [11:0] hold_rx, hold_ry;      // ★ 2026-10-23：实测分辨率也要锁存，否则整屏乱闪
+
+    reg  [1:0] auto_cnt;
+    reg        k1_s0, k1_s1;
+    wire       snap_key  = k1_s0 & ~k1_s1;
+    wire       snap_auto = (auto_cnt == 2'd2) && (dbg_win == 26'd49_999_999);
+    wire       do_snap   = snap_key | snap_auto;
+
+    always @(posedge sys_clk or negedge rstn_out) begin
+        if (!rstn_out) begin
+            dbg_win    <= 26'd0;
+            in_hs_num  <= 20'd0;
+            in_vs_num  <= 20'd0;
+            in_de_tgl  <= 1'b0;
+            pc_low_d   <= 4'd0;
+            pc_act     <= 1'b0;
+            live_hs    <= 20'd0;
+            live_vs    <= 20'd0;
+            live_detgl <= 1'b0;
+            live_pcact <= 1'b0;
+            hold_hs    <= 20'd0;
+            hold_vs    <= 20'd0;
+            hold_detgl <= 1'b0;
+            hold_pcact <= 1'b0;
+            hold_lk    <= 1'b0;
+            hold_sz    <= 1'b0;
+            hold_init  <= 1'b0;
+            hold_rx    <= 12'd0;
+            hold_ry    <= 12'd0;
+            auto_cnt   <= 2'd0;
+            k1_s0      <= 1'b0;
+            k1_s1      <= 1'b0;
+        end else begin
+            k1_s0 <= key_pressed;
+            k1_s1 <= k1_s0;
+
+            if (in_hs_s[2:1] == 2'b01) in_hs_num <= in_hs_num + 20'd1;
+            if (in_vs_s[2:1] == 2'b01) in_vs_num <= in_vs_num + 20'd1;
+            if (in_de_s[2] != in_de_s[1]) in_de_tgl <= 1'b1;
+
+            // pixclk 活动检测：只看低 4 位变化（跨域安全）
+            if (in_pc_cnt[3:0] != pc_low_d) begin
+                pc_low_d <= in_pc_cnt[3:0];
+                pc_act   <= 1'b1;
+            end
+
+            // 1 秒结算 -> live
+            if (dbg_win == 26'd49_999_999) begin
+                dbg_win    <= 26'd0;
+                live_hs    <= in_hs_num;
+                live_vs    <= in_vs_num;
+                live_detgl <= in_de_tgl;
+                live_pcact <= pc_act;
+                in_hs_num  <= 20'd0;
+                in_vs_num  <= 20'd0;
+                in_de_tgl  <= 1'b0;
+                pc_act     <= 1'b0;
+                if (auto_cnt != 2'd3) auto_cnt <= auto_cnt + 2'd1;
+            end else begin
+                dbg_win <= dbg_win + 26'd1;
+            end
+
+            // ★ 按 KEY1（或上电第 3 秒）冻结一次
+            if (do_snap) begin
+                hold_hs    <= live_hs;
+                hold_vs    <= live_vs;
+                hold_detgl <= live_detgl;
+                hold_pcact <= live_pcact;
+                hold_lk    <= in_lk_s[2];
+                hold_sz    <= in_sz_s[2];
+                hold_init  <= init_over_rx;
+                hold_rx    <= hdmi_rx;      // 实测水平像素（锁存后稳定）
+                hold_ry    <= hdmi_ry;      // 实测垂直行数
+            end
+        end
+    end
+
+    //========================================================================
+    // ★ HDMI_IN3 候选引脚测量（2026-10-21 晚新增）
+    //
+    //   和 IN1 用完全相同的测量方法，放在同一屏里对比：
+    //     如果 IN3 的 HS 计数 ≈ 16（即 67500 次/秒），而 IN1 是乱数，
+    //     就说明板子的 HDMI-IN 用的是 IN3 的引脚组。
+    //========================================================================
+    reg [2:0] i3_pc_s, i3_hs_s, i3_vs_s, i3_de_s;
+    reg [3:0] i3_pc_low_d;
+    reg       i3_pc_act, i3_de_tgl;
+    reg [19:0] i3_hs_num, i3_vs_num;
+    reg [19:0] live3_hs, live3_vs;
+    reg        live3_pcact, live3_detgl;
+    reg [19:0] hold3_hs, hold3_vs;
+    reg        hold3_pcact, hold3_detgl;
+
+    always @(posedge sys_clk or negedge rstn_out) begin
+        if (!rstn_out) begin
+            i3_pc_s <= 3'd0; i3_hs_s <= 3'd0; i3_vs_s <= 3'd0; i3_de_s <= 3'd0;
+            i3_pc_low_d <= 4'd0; i3_pc_act <= 1'b0; i3_de_tgl <= 1'b0;
+            i3_hs_num <= 20'd0; i3_vs_num <= 20'd0;
+            live3_hs <= 20'd0; live3_vs <= 20'd0;
+            live3_pcact <= 1'b0; live3_detgl <= 1'b0;
+            hold3_hs <= 20'd0; hold3_vs <= 20'd0;
+            hold3_pcact <= 1'b0; hold3_detgl <= 1'b0;
+        end else begin
+            i3_pc_s <= {i3_pc_s[1:0], pixclk_in3};
+            i3_hs_s <= {i3_hs_s[1:0], hs_in3    };
+            i3_vs_s <= {i3_vs_s[1:0], vs_in3    };
+            i3_de_s <= {i3_de_s[1:0], de_in3    };
+
+            if (i3_hs_s[2:1] == 2'b01) i3_hs_num <= i3_hs_num + 20'd1;
+            if (i3_vs_s[2:1] == 2'b01) i3_vs_num <= i3_vs_num + 20'd1;
+            if (i3_de_s[2]   != i3_de_s[1]) i3_de_tgl <= 1'b1;
+
+            if (i3_pc_s[1] != i3_pc_low_d[3]) begin
+                i3_pc_low_d[3] <= i3_pc_s[1];
+                i3_pc_act      <= 1'b1;
+            end
+
+            // 复用 IN1 的 1 秒结算点：dbg_win 回绕那一拍
+            if (dbg_win == 26'd49_999_999) begin
+                live3_hs    <= i3_hs_num;
+                live3_vs    <= i3_vs_num;
+                live3_pcact <= i3_pc_act;
+                live3_detgl <= i3_de_tgl;
+                i3_hs_num   <= 20'd0;
+                i3_vs_num   <= 20'd0;
+                i3_pc_act   <= 1'b0;
+                i3_de_tgl   <= 1'b0;
+            end
+
+            // 和 IN1 一起锁存
+            if (do_snap) begin
+                hold3_hs    <= live3_hs;
+                hold3_vs    <= live3_vs;
+                hold3_pcact <= live3_pcact;
+                hold3_detgl <= live3_detgl;
+            end
+        end
+    end
+
+    wire [7:0] dbg_hs3_byte = hold3_hs[19:12];
+
+    //========================================================================
+    // 行0 = 四种极性组合的锁定/尺寸结果（2026-10-23）
+    //   col0 A_lock  col1 B_lock  col2 C_lock  col3 D_lock
+    //   col4 A_size  col5 B_size  col6 C_size  col7 D_size
+    //   A: vs高/de高   B: vs高/de低   C: vs低/de高   D: vs低/de低
+    //   ★ 哪一列的 lock 和 size 同时为绿，就是正确的极性组合
+    //
+    // 行1 = 实测水平有效像素 hold_rx[11:4]  （1920 -> 0x78 = 0111 1000）
+    // 行2 = 实测垂直有效行数 hold_ry[11:4]  （1080 -> 0x43 = 0100 0011）
+    //========================================================================
+    wire [7:0] dbg_status = {
+        m_d_size, m_c_size, m_b_size, m_a_size,
+        m_d_lock, m_c_lock, m_b_lock, m_a_lock
+    };
+
+    wire [7:0] dbg_hs_byte = hold_rx[11:4];    // 实测水平像素（已锁存）
+    wire [7:0] dbg_vs_byte = hold_ry[11:4];    // 实测垂直行数（已锁存）
+
+    wire [2:0]  dbg_col = rd_x[11:8];              // 0..7，每列 256 像素
+    wire [1:0]  dbg_row = (rd_y <  12'd360) ? 2'd0 :
+                          (rd_y <  12'd720) ? 2'd1 : 2'd2;
+    reg         dbg_bit;
+    always @(*) begin
+        case (dbg_row)
+            2'd0:   dbg_bit = dbg_status [dbg_col];
+            2'd1:   dbg_bit = dbg_hs_byte[dbg_col];
+            default: dbg_bit = dbg_vs_byte[dbg_col];
+        endcase
+    end
+
+    wire dbg_sep = (rd_x[7:0] == 8'd0);            // 列间黑缝
+    wire dbg_hor = (rd_y == 12'd360) || (rd_y == 12'd720);   // 行间黑线
+    wire [23:0] dbg_rgb = (dbg_sep || dbg_hor) ? 24'h000000
+                                               : (dbg_bit ? 24'h00FF00 : 24'hFF0000);
+
+    // 三态显示选择（H17 按键循环 0->1->2）
+    //   mode 0 = 原图彩色
+    //   mode 1 = 灰度（走 gray_scale3x：3x3 块平均降采样 + x3 放大）
+    //   mode 2 = 2x2 四宫格
+    //========================================================================
+    //========================================================================
+    // 显示选择（2026-10-24 修正 mode5 的灰度条纹）
+    //
+    //   ★ 问题：真实道路图源是 240x135 放大 8 倍，每个源像素是 8x8 的块。
+    //     而 gray_scale3x 做的是"每 3 行/3 列取平均 -> 640x360 -> 再 x3 放大"。
+    //     8 和 3 互质 -> 采样相位每 24 行循环一次 -> 每 72 行出现一次明暗带，
+    //     屏幕上就是规则的横向条纹。
+    //
+    //   修法：真实道路模式（use_road=1）下灰度直接取组合派生的 q_grey（无降采样），
+    //         和四宫格右上角同一个信号，画面干净。
+    //         合成场景（mode 1）仍然走 gray_scale3x，保留"3x3 块平均"的演示效果。
+    //========================================================================
+    wire        sel_gray = (disp_mode[1:0] == 2'd1);
+    wire [23:0] gray_rgb = use_road ? q_grey : {3{gs_gray}};
+    wire        gray_de  = use_road ? quad_de : gs_de;
+    wire        gray_hs  = use_road ? quad_hs : gs_hs;
+    wire        gray_vs  = use_road ? quad_vs : gs_vs;
+
+    wire        mix_de  = sel_gray ? gray_de : quad_de;
+    wire        mix_hs  = sel_gray ? gray_hs : quad_hs;
+    wire        mix_vs  = sel_gray ? gray_vs : quad_vs;
+    wire [23:0] mix_rgb = (disp_mode[1:0] == 2'd3) ? dbg_rgb  :
+                          sel_gray                  ? gray_rgb :
+                          (disp_mode[1:0] == 2'd2) ? quad_rgb :
+                                                      q_color;
+
+    wire [7:0] mix_r = mix_rgb[23:16];
+    wire [7:0] mix_g = mix_rgb[15:8];
+    wire [7:0] mix_b = mix_rgb[7:0];
+
+    // ---- 箭头朝向 = 检测链的决策结果（2026-10-20 改）----
+    //   原来这里是一个"每 60 帧自动轮换"的计数器（纯演示用）。
+    //   现在接真检测结果：ctrl_fsm.o_arrow = lane_sel（K18 按键循环 左转/直行/右转）。
+    //   ⚠️ ctrl_fsm 内部 o_arrow <= i_lane_sel，所以这里等价于直接看 lane_sel；
+    //      但走一遍 FSM 更符合原设计意图，也方便以后接障碍/红绿灯的决策。
+    wire [1:0] arrow_sel = fsm_arrow;
+
+    // ---- 方块颜色 = 检测到的右侧车道线类型（2026-10-20，21:50 修正编码）----
+    //   ⚠️ 这里踩过一个坑，记清楚：
+    //     lane_detect.v 的 cls() 返回的是 **0=无 / 1=实线 / 2=虚线**
+    //     （请看 lane_detect.v:114-121 的 if-else 顺序）
+    //     而 ctrl_fsm.v 的 parameter 写的是 LINE_SOLID=2'd0 / LINE_NONE=2'd2
+    //     —— 两边的编码**对不上**（原作者的不一致）。
+    //   所以这里显式按 lane_detect 的编码上色，并给 ctrl_fsm 做一次重映射。
+    reg [23:0] box0_color;
+    always @(*) begin
+        case (lane_type_r)
+            2'd0:    box0_color = 24'hFF2020;   // 无   -> 红
+            2'd1:    box0_color = 24'h00FF40;   // 实线 -> 绿
+            default: box0_color = 24'hFFFF00;   // 虚线 -> 黄
+        endcase
+    end
+
+    // ---- 报警闪烁时钟（约 2.2Hz）----
+    //   ⚠️ 必须声明在使用之前：下面 osd 的 i_arrow_en 和最后 led[3] 都要用它。
+    //      虽然 iverilog 允许前向引用，但 PDS 的检查更严格，提前声明更保险。
+    reg [25:0] alm_cnt;
+    always @(posedge pix_clk or negedge fb_init_done) begin
+        if (!fb_init_done) alm_cnt <= 26'd0;
+        else               alm_cnt <= alm_cnt + 26'd1;
+    end
+    wire alm_blink = alm_cnt[25];    // @148MHz 约 0.23s 翻转一次 -> 2.2Hz
+
+    // ---- 把 lane_detect 的编码转成 ctrl_fsm 期望的编码 ----
+    //   lane_detect:  0=无  1=实线  2=虚线
+    //   ctrl_fsm:     0=实线  .  2=无（见 ctrl_fsm.v 的 parameter）
+    //   虚线在 ctrl_fsm 里没有专门的参数，映射成 1（既不是实线也不是无）
+    wire [1:0] line_type_fsm = (lane_type_r == 2'd1) ? 2'd0 :   // 实线 -> 0
+                               (lane_type_r == 2'd2) ? 2'd1 :   // 虚线 -> 1
+                                                       2'd2;    // 无   -> 2
+
+    // ---- OSD 叠加 ----
+    wire        osd_de, osd_hs, osd_vs;
+    wire [23:0] osd_rgb;
+
+    osd_overlay #(
+        .MIX_LATENCY (3),
+        // 参考框 1：右侧绿色半透明边框（固定 α≈37%），标一个"关注区域"
+        .BOX1_X0     (12'd667 ),
+        .BOX1_Y0     (12'd200 ),
+        .BOX1_X1     (12'd1133),
+        .BOX1_Y1     (12'd533 ),
+        .BOX1_COLOR  (24'h00FF00),
+        .BOX1_ALPHA  (5'd6),
+        .BOX_TH      (4'd3)
+    ) u_osd (
+        .clk          (pix_clk           ),
+        .rst_n        (fb_init_done      ),
+        .i_de         (mix_de            ),
+        .i_hs         (mix_hs            ),
+        .i_vs         (mix_vs            ),
+        .i_rgb        ({mix_r, mix_g, mix_b}),
+        // 运行时矩形：左侧红色半透明实心块（α 固定 50%）
+        // 2026-10-25 改：原来是 700x500 的整块实心色块（200,200)-(900,700)，
+        //   视觉上完全像一个 bug。改成左上角 160x100 的小色块，当作「右侧车道线类型指示灯」：
+        //     红 = 无车道线 / 绿 = 实线（不能变道）/ 黄 = 虚线（可以变道）
+        .i_box0_en    (1'b0             ),   // ★ 2026-10-30 关掉左上角绿框，其他不变
+        .i_box0_x0    (12'd40            ),
+        .i_box0_y0    (12'd40            ),
+        .i_box0_x1    (12'd200           ),
+        .i_box0_y1    (12'd140           ),
+        .i_box0_color (box0_color        ),
+        .i_box0_alpha (5'd8              ),
+        .i_box0_fill  (1'b1              ),
+        // 转向箭头：白色不透明，朝向每秒轮换（0=左转 1=直行 2=右转）
+        .i_arrow_en   (fsm_alarm ? alm_blink : fsm_motion),  // 报警闪 / 红灯停时灭 / 正常常亮
+        .i_arrow_sel  (arrow_sel         ),
+        .i_arrow_x    (12'd150           ),
+        .i_arrow_y    (12'd530           ),   // 720p: 原 800
+        .i_arrow_color(24'hFFFFFF        ),
+        .i_arrow_alpha(5'd16             ),
+        .o_de         (osd_de            ),
+        .o_hs         (osd_hs            ),
+        .o_vs         (osd_vs            ),
+        .o_rgb        (osd_rgb           )
+    );
+
+    //========================================================================
+    // 送引脚（OSD 之后的流）
+    //========================================================================
+    assign pixclk_out = pix_clk;
+    assign vs_out     = osd_vs;
+    assign hs_out     = osd_hs;
+    assign de_out     = osd_de;
+
+    assign r_out = osd_rgb[23:16];
+    assign g_out = osd_rgb[15:8];
+    assign b_out = osd_rgb[7:0];
+
+    //========================================================================
+    // 心跳灯（core_clk 域，与厂商做法一致）
+    //========================================================================
+    reg [26:0] hb_cnt;
+    reg        heart_beat;
+
+    always @(posedge core_clk) begin
+        if (!ddr_init_done)
+            hb_cnt <= 27'd0;
+        else if (hb_cnt >= TH_1S[26:0])
+            hb_cnt <= 27'd0;
+        else
+            hb_cnt <= hb_cnt + 27'd1;
+    end
+
+    always @(posedge core_clk) begin
+        if (!ddr_init_done)
+            heart_beat <= 1'b1;
+        else if (hb_cnt >= TH_1S[26:0])
+            heart_beat <= ~heart_beat;
+    end
+
+    //========================================================================
+    // ★ 2026-10-18 临时诊断：灰度流水线活动指示
+    //
+    //   把 led[3] 从"废弃的 verify_ok"（那个逐像素校验有相位问题、永远不亮）
+    //   改成"灰度流水线是否在产出块"。
+    //
+    //   判读：
+    //     led[3] 闪  -> scaler 在产出 640x360 的块，灰度流水线是活的
+    //     led[3] 灭  -> scaler 一个块都没产出，问题在 scaler 输入端
+    //
+    //   排查完记得恢复成 verify_ok（或删掉这段）。
+    //========================================================================
+    reg [24:0] gs_cnt;
+    always @(posedge pix_clk) begin
+        if (!fb_init_done)
+            gs_cnt <= 25'd0;
+        else if (gs_de)
+            gs_cnt <= gs_cnt + 25'd1;
+    end
+    wire gs_act = gs_cnt[24];        // 约 1 秒翻转一次（肉眼可见）
+
+    //========================================================================
+    // LED
+    //========================================================================
+    assign led[0] = ddr_init_done;   // DDR3 初始化完成
+    assign led[1] = fb_init_done;    // fram_buf 就绪
+    // 2026-10-27 改：led[2] 改成摄像头诊断灯（heart_beat 与 led[0]/led[1] 信息重复）
+    // 2026-10-27 改：led[2] 显示"是否见过 VSYNC 跳变"（锁存）
+    //   VSYNC 可能在 pclk 上升/下降沿变化，也可能高有效或低有效，
+    //   所以这里检测【任意跳变】，极性无关。
+    reg vs_d0, vs_d1;
+    always @(posedge cmos1_pclk) begin
+        vs_d0 <= cmos1_vsync;
+        vs_d1 <= vs_d0;
+    end
+
+    reg cam_vs_seen;
+    always @(posedge cmos1_pclk) begin
+        if (vs_d0 ^ vs_d1) cam_vs_seen <= 1'b1;   // 见过一次跳变就锁存
+    end
+
+    //====================================================================
+    // 摄像头诊断（2026-10-27 第三版）
+    //
+    //   已确认（上一版）：PCLK 在跳、VSYNC 在跳（cam_vs_seen 锁存成功）。
+    //   所以剩下两个未知：HREF 和 DATA。
+    //
+    //   led[2] = 见过 HREF 高电平  -> 灭 = HREF 引脚没信号（帧内无数据窗口）
+    //   led[3] = 见过非零 DATA     -> 灭 = 数据线没信号 / 全黑图
+    //====================================================================
+    reg cam_href_seen;
+    always @(posedge cmos1_pclk) begin
+        if (cam_href_d0) cam_href_seen <= 1'b1;
+    end
+    assign led[2] = cam_init_done;   // 亮 = I2C 配置完成（这才是 wr_use_cam 的开关）
+
+    reg [7:0] cam_data_or;
+    always @(posedge cmos1_pclk) begin
+        if (cam_href_d0) cam_data_or <= cam_data_or | cam_d_d0;
+    end
+    // 只要任意一位曾经为 1 就点亮（全黑画面时仍为灭）
+    // led[3]：显示新的 pclk/2 写时钟是否在跳（闪烁 = 帧缓存有写时钟）
+    // led[3]：NACK 判据（2026-10-28）
+    //   cam_nack_cnt ≈ 0    -> 摄像头每次 I2C 都应答（存在）
+    //   cam_nack_cnt ≈ 516  -> 一次都没应答（摄像头不在/没供电/引脚错）
+    //   258 个寄存器 x 2 字节 ≈ 516 次事务
+    // led[3] 恢复成业务指示：见过车道线 / 有报警时闪烁
+    // led[3]：报警时闪烁 / 否则常亮表示"检测到过车道线"
+    //   2026-10-28 改：原来用的 lane_seen 变量在几轮改动中被误删，
+    //   这里直接用 lane_type_l/lane_type_r（都是 wire，确认存在）组合，
+    //   语义等价：任一侧检测到车道线（实线/虚线）就算"见过"。
+    wire lane_any = (lane_type_l != 2'd0) || (lane_type_r != 2'd0);
+    assign led[3] = fsm_alarm ? alm_blink : lane_any;
+    // 摄像头 PCLK / VSYNC 活动另存，供 Fabric Debugger 观察（VSYNC 已确认在跳）
+    wire       _unused_vs_seen  = cam_vs_seen;
+
+
+    // 保留：读侧活动与帧统计，供 Fabric Debugger 观察
+    wire [31:0] dbg_ok_frames  /* synthesis PAP_MARK_DEBUG="1" */ = ok_frames;
+    wire [31:0] dbg_bad_frames /* synthesis PAP_MARK_DEBUG="1" */ = bad_frames;
+    wire [31:0] dbg_err_pixels /* synthesis PAP_MARK_DEBUG="1" */ = err_pixels;
+    wire        dbg_rd_active  /* synthesis PAP_MARK_DEBUG="1" */ = rd_active_tgl;
+
+    // 以下信号仅用于调试标记，避免综合把上面几个 wire 优化掉
+    //   ★ 2026-10-17：去掉 clk_25M（新 PLL 没有 clkout2）
+    wire _unused_ok = &{1'b0, dbg_ok_frames[0], dbg_bad_frames[0],
+                        dbg_err_pixels[0], dbg_rd_active,
+                        init_over_tx, init_over_rx, wr_de_re, wr_hs,
+                        rd_de, rd_hs, pll_lock_ddr, locked,
+                        verify_ok, gs_act, gs_hs, gs_vs,
+                        // 检测链的中间结果：不接引脚，但留在这里防止被优化掉，
+                        // 方便用 Fabric Debugger 观察/定位（2026-10-20 新增）
+                        fsm_lane, fsm_tl, fsm_line, fsm_motion, fsm_led_lane,
+                        fsm_alarm, lane_type_l, lane_pos_l, lane_pos_r,
+                        bin_level, sc_de, sc_hs, sc_vs, sc_rgb888[0]};
+
+endmodule
+
+//=============================================================================
+// 模块名 : hdmi_wr
+// 功能   : 从真实 HDMI 输入的 DE 派生写侧时序（**不依赖 vs**）
+//
+//   背景（2026-10-25 实测确认）：
+//     · de_in(U13) 每行都有上升沿，PROBE_MODE=10 测得 >=30kHz = 行频 -> DE 正常
+//     · vs_in(W13) 不是可用的场同步 -> 原 video_monitor 永远锁不上
+//
+//   参考 2023 集创赛紫光同创杯一等奖方案 video_zoom.v：
+//     像素采集完全不依赖 vs，只用 vs 复位地址。
+//   本模块更进一步：**一个 vs 都不用**，改用 DE 的个数：
+//     1080p60 每帧恰好 1080 个 DE 上升沿、每行恰好 1920 个 DE 高电平拍，
+//     所以从 DE 数到 1080 就是一个完整帧 —— 自对齐、误差不累积。
+//
+//   输出：
+//     o_vs     : 合成的场同步（第 0 行有效期间为高），给 fram_buf.wr_fsync
+//     o_de     : 直接透传 de_in，给 fram_buf.wr_en
+//     o_rgb565 : RGB888 -> RGB565
+//
+//   作者: 队伍自研（人2）
+//=============================================================================
+module hdmi_wr (
+    input  wire        clk,        // 像素时钟 pixclk_in（HDMI 侧，148.5MHz@1080p60）
+    input  wire        rst_n,      // 低有效
+    input  wire        de,         // HDMI DE（高有效）
+    input  wire [7:0]  r,          // R[7:0]
+    input  wire [7:0]  g,          // G[7:0]
+    input  wire [7:0]  b,          // B[7:0]
+    output wire        o_vs,       // 合成场同步（64 拍脉冲，每 1080 行一次）
+    output wire        o_de,       // 数据有效（透传）
+    output wire [15:0] o_rgb565    // RGB565
+);
+    localparam [11:0] V_ACT = 12'd1080;
+
+    // DE 低电平持续计数：用来识别垂直消隐期
+    //   1080p60：水平消隐约 280 拍，垂直消隐约 99000 拍（45 行）
+    //   阈值取 2 行的长度（4400 拍）就能把两者彻底分开
+    localparam [19:0] GAP_TH = 20'd4400;
+
+    reg  [19:0] gap_cnt;
+    reg         de_d;
+    reg  [5:0]  vs_pulse;
+    wire        de_rise = de & ~de_d;
+    wire        in_vblank = (gap_cnt > GAP_TH);   // 处于垂直消隐期
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            de_d     <= 1'b0;
+            gap_cnt  <= 20'd0;
+            vs_pulse <= 6'd0;
+        end else begin
+            de_d <= de;
+
+            // DE 低电平计数器（饱和，避免溢出）
+            if (de)
+                gap_cnt <= 20'd0;
+            else if (gap_cnt != 20'hF_FFFF)
+                gap_cnt <= gap_cnt + 20'd1;
+
+            // 场同步脉冲倒数
+            if (vs_pulse != 6'd0)
+                vs_pulse <= vs_pulse - 6'd1;
+
+            // ★ 帧起点 = 垂直消隐之后的第一个 DE 上升沿（= 第 0 行第 0 个像素）
+            //   这个判据不依赖"每帧恰好 1080 行"，所以不会漂移。
+            if (de_rise && in_vblank)
+                vs_pulse <= 6'd63;
+        end
+    end
+
+    assign o_vs     = (vs_pulse != 6'd0);
+    assign o_de     = de;
+    assign o_rgb565 = {r[7:3], g[7:2], b[7:3]};
+endmodule
+
+//=============================================================================
+// [2026-10-27] OV5640 camera support modules
+//
+//   These three modules come from the official demo 10_HDMI_DDR3_OV5640_test.
+//   They are APPENDED HERE because the PDS project file (.pds) cannot be edited
+//   by hand (PDS rewrites it from temp_projects on every open), so any brand-new
+//   .v file added to disk would never be compiled.
+//
+//   Encoding: the originals were GBK; converted to UTF-8 while appending.
+//=============================================================================
+
+//-----------------------------------------------------------------------------
+// module power_on_delay   (from official 10_HDMI_DDR3_OV5640_test)
+//-----------------------------------------------------------------------------
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company:Meyesemi 
+// Engineer: Will
+// 
+// Create Date: 2023-03-17  
+// Design Name:  
+// Module Name: 
+// Project Name: 
+// Target Devices: Pango
+// Tool Versions: 
+// Description: 
+//      
+// Dependencies: 
+// 
+// Revision:
+// Revision 1.0 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+//camera power on timing requirement
+module power_on_delay(                  
+    input  clk_50M        ,
+    input  reset_n        ,
+    output camera1_rstn   ,
+    output camera2_rstn   ,
+    output camera_pwnd    ,
+    output initial_en
+);
+reg [18:0]cnt1;
+reg [15:0]cnt2;
+reg [19:0]cnt3;
+reg initial_en;
+reg camera_rstn_reg;
+reg camera_pwnd_reg;
+
+assign camera1_rstn=camera_rstn_reg;
+assign camera2_rstn=camera_rstn_reg;
+assign camera_pwnd=camera_pwnd_reg;
+
+//5ms, delay from sensor power up stable to Pwdn pull down
+always@(posedge clk_50M)begin
+  if(reset_n==1'b0) begin
+	    cnt1<=0;
+		camera_pwnd_reg<=1'b1;// 1'b1 
+  end
+  else if(cnt1<19'h40000) begin
+       cnt1<=cnt1+1'b1;
+       camera_pwnd_reg<=1'b1;
+  end
+  else
+     camera_pwnd_reg<=1'b0;         
+end
+
+//1.3ms, delay from pwdn low to resetb pull up
+always@(posedge clk_50M)begin
+  if(camera_pwnd_reg==1)  begin
+	 cnt2<=0;
+     camera_rstn_reg<=1'b0;  
+  end
+  else if(cnt2<16'hffff) begin
+       cnt2<=cnt2+1'b1;
+       camera_rstn_reg<=1'b0;
+  end
+  else
+     camera_rstn_reg<=1'b1;         
+end
+
+//21ms, delay from resetb pul high to SCCB initialization
+always@(posedge clk_50M)begin
+  if(camera_rstn_reg==0) begin
+         cnt3<=0;
+         initial_en<=1'b0;
+  end
+  else if(cnt3<20'hfffff) begin
+        cnt3<=cnt3+1'b1;
+        initial_en<=1'b0;
+  end
+  else
+       initial_en<=1'b1;    
+end
+
+endmodule
+
+//-----------------------------------------------------------------------------
+// module cmos_8_16bit   (from official 10_HDMI_DDR3_OV5640_test)
+//-----------------------------------------------------------------------------
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company:Meyesemi 
+// Engineer: Will
+// 
+// Create Date: 2023-03-17  
+// Design Name:  
+// Module Name: 
+// Project Name: 
+// Target Devices: Pango
+// Tool Versions: 
+// Description: 
+//      
+// Dependencies: 
+// 
+// Revision:
+// Revision 1.0 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+//将两个8bit数据拼成一个16bit RGB565数据；
+`timescale 1ns/1ns
+
+module cmos_8_16bit(
+	input 				   pclk 		,   
+	input 				   rst_n		,
+	input				   de_i	        ,
+	input	[7:0]	       pdata_i	    ,
+    input                  vs_i         ,
+
+    output                 pixel_clk    ,
+ 	output	reg			   de_o         ,
+	output  reg [15:0]	   pdata_o
+); 
+reg			de_out1          ;
+reg [15:0]	pdata_out1       ;
+reg			de_out2          ;
+reg [15:0]	pdata_out2       ;    
+reg [1:0]   cnt             ;
+wire        pclk_IOCLKBUF   ;
+reg         vs_i_reg        ;
+reg         enble           ;
+reg [7:0] pdata_i_reg;
+reg de_i_r,de_i_r1;
+reg			de_out3          ;
+reg [15:0]	pdata_out3       ;  
+always @(posedge pclk)begin
+       vs_i_reg <= vs_i ;
+end
+    always@(posedge pclk)
+        begin
+            if(!rst_n)
+                enble <= 1'b0;
+            else if(!vs_i_reg&&vs_i)
+                enble <= 1'b1;
+            else
+                enble <= enble;
+        end
+
+    //--------------------------------------------------------------------
+    // pclk/2 时钟（2026-10-28 改：不再用 GTP_IOCLKBUF / GTP_IOCLKDIV）
+    //
+    //   原来：
+    //     GTP_IOCLKBUF(.CLKIN(pclk), .DI(enble))    // enble 门控时钟
+    //     GTP_IOCLKDIV(.CLKIN(pclk_IOCLKBUF), .RST_N(enble))
+    //
+    //   这两个是 Pango 专用时钟原语，要求输入来自"时钟专用引脚"并走专用网络。
+    //   cmos1_pclk(T12) 若不是时钟专用脚，它们就路由不上 -> pixel_clk 永远不跳
+    //   -> 写侧零时钟 -> 帧缓存永不更新 -> 画面定格。
+    //   （而摄像头的 PCLK/VSYNC/HREF/DATA 六路原始信号实测都正常，
+    //     说明问题就出在这两个原语上。）
+    //
+    //   改成普通触发器二分频：不依赖任何专用时钟资源，一定能跑。
+    //   相位由 rst_n(=cam_init_done) 复位确定，与 de_out1 的相位关系是稳定的。
+    //--------------------------------------------------------------------
+    //--------------------------------------------------------------------
+    //--------------------------------------------------------------------
+    // pclk/2 写时钟（2026-10-28 修正版，最终）
+    //
+    //   为什么必须自己生成 pclk/2：
+    //     原来用 GTP_IOCLKBUF + GTP_IOCLKDIV 两个 Pango 专用时钟原语，
+    //     它们要求输入来自时钟专用引脚 / 走专用网络。cmos1_pclk(T12) 满足不了，
+    //     结果 pixel_clk 永远是死的 -> 写侧零时钟 -> 帧缓存永不更新 -> 画面定格。
+    //
+    //   为什么在【下降沿】翻转：
+    //     pdata_out1 在 pclk 上升沿更新，每个像素保持 2 个 pclk 周期。
+    //     pclk_half 若也在上升沿翻转，它的边沿和 pdata_out1 的跳变沿重合
+    //     -> 建立/保持时间不够 -> 偶发采到错的像素（颜色错乱、撕裂）。
+    //     改到下降沿翻转，采样点落在 pclk 周期正中间，裕量半个周期。
+    //
+    //   ⚠️ 注意：pclk_half 必须【自由翻转】，不能只在 HREF 期间产生边沿。
+    //      否则 HREF 结束后没有时钟边沿，de_out2/3 停止更新，de_o 会卡在高电平，
+    //      wr_buf 的 wr_en 不归零 -> 行计数彻底乱掉。
+    //--------------------------------------------------------------------
+    reg pclk_half;
+    always @(negedge pclk)
+    begin
+        if (!rst_n) pclk_half <= 1'b0;
+        else        pclk_half <= ~pclk_half;
+    end
+    assign pixel_clk = pclk_half;
+
+    always@(posedge pclk)
+        begin
+            if(!rst_n)
+                cnt <= 2'b0;
+            else if(de_i == 1'b1 && cnt == 2'd1)
+                cnt <= 2'b0;
+            else if(de_i == 1'b1)
+                cnt <= cnt + 1'b1;
+        end
+    
+
+    always@(posedge pclk)
+        begin
+            if(!rst_n)
+                pdata_i_reg <= 8'b0;
+            else if(de_i == 1'b1)
+                pdata_i_reg <= pdata_i;
+        end
+    
+    always@(posedge pclk)
+        begin
+            if(!rst_n)
+                pdata_out1 <= 16'b0;
+            else if(de_i == 1'b1 && cnt == 2'd1)
+                pdata_out1 <= {pdata_i_reg,pdata_i};
+        end
+  
+
+   always@(posedge pclk)begin
+        de_i_r <= de_i;
+        de_i_r1 <= de_i_r;
+   end
+    always@(posedge pclk)
+        begin
+            if(!rst_n)
+                de_out1 <= 1'b0;
+            else if(!de_i_r1 && de_i_r )//上升沿
+                de_out1 <= 1'b1;
+            else if(de_i_r1 && !de_i_r )//下降沿
+                de_out1 <= 1'b0;
+            else
+                de_out1 <= de_out1;
+        end
+
+ 
+    always@(posedge pixel_clk)begin
+        de_out2<=de_out1;
+        de_out3<=de_out2;
+        de_o   <=de_out3;
+    end
+    always@(posedge pixel_clk)begin
+        pdata_out2<=pdata_out1;
+        pdata_out3<=pdata_out2;
+        pdata_o   <=pdata_out3;
+    end
+endmodule
+
+//-----------------------------------------------------------------------------
+// module reg_config   (from official 10_HDMI_DDR3_OV5640_test)
+//-----------------------------------------------------------------------------
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company:Meyesemi 
+// Engineer: Will
+// 
+// Create Date: 2023-03-17  
+// Design Name:  
+// Module Name: 
+// Project Name: 
+// Target Devices: Pango
+// Tool Versions: 
+// Description: 
+//      
+// Dependencies: 
+// 
+// Revision:
+// Revision 1.0 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+//camera中寄存器的配置程序
+ module reg_config(     
+		  input clk_25M,
+		  input camera_rstn,
+		  input initial_en,
+		  output reg_conf_done,
+		  output i2c_sclk,
+		  inout i2c_sdat,
+		  output reg clock_20k,
+		  output reg [8:0]reg_index,
+		  // 2026-10-27 新增：NACK 计数输出（诊断摄像头是否真的应答 I2C）
+		  output reg [15:0] o_nack_cnt
+	  );
+
+     reg [15:0]clock_20k_cnt;
+     reg [1:0]config_step;	  
+     reg [31:0]i2c_data;
+     reg [23:0]reg_data;
+     reg start;
+	 reg reg_conf_done_reg;
+	  
+     i2c_com u1(.clock_i2c(clock_20k),
+               .camera_rstn(camera_rstn),
+               .ack(ack),
+               .i2c_data(i2c_data),
+               .start(start),
+               .tr_end(tr_end),
+               .i2c_sclk(i2c_sclk),
+               .i2c_sdat(i2c_sdat));
+
+assign reg_conf_done=reg_conf_done_reg;
+
+	 // 2026-10-27 新增：统计 I2C NACK 次数
+	 //   每次 I2C 传输结束(tr_end)时如果 ack=0，说明从设备没应答。
+	 //   摄像头正常时应该几乎是 0；如果接近 2x258，说明摄像头根本没接上/没供电。
+	 always @(posedge clk_25M or negedge camera_rstn) begin
+	     if (!camera_rstn)      o_nack_cnt <= 16'd0;
+	     else if (tr_end && !ack) o_nack_cnt <= o_nack_cnt + 16'd1;
+	 end
+//产生i2c控制时钟-20khz    
+always@(posedge clk_25M)   
+begin
+   if(!camera_rstn) begin
+        clock_20k<=0;
+        clock_20k_cnt<=0;
+   end
+   else if(clock_20k_cnt<1249)
+      clock_20k_cnt<=clock_20k_cnt+1'b1;
+   else begin
+         clock_20k<=!clock_20k;
+         clock_20k_cnt<=0;
+   end
+end
+
+////iic寄存器配置过程控制    
+always@(posedge clock_20k)    
+begin
+   if(!camera_rstn) begin
+       config_step<=0;
+       start<=0;
+       reg_index<=0;
+		 reg_conf_done_reg<=0;
+   end
+   else begin
+      if(reg_conf_done_reg==1'b0) begin          //如果camera初始化未完成
+			  if(reg_index<357) begin               //配置寄存器
+					 case(config_step)
+					 0:begin
+						i2c_data<={8'h78,reg_data};       //OV5640 IIC Device address is 0x78   
+						start<=1;                         //i2c写开始
+						config_step<=1;                  
+					 end
+					 1:begin
+						if(tr_end) begin                  //i2c写结束               					
+							 start<=0;
+							 config_step<=2;
+						end
+					 end
+					 2:begin
+						  reg_index<=reg_index+1'b1;       //配置下一个寄存器
+						  config_step<=0;
+					 end
+					 endcase
+				end
+			 else 
+				reg_conf_done_reg<=1'b1;                //OV5640寄存器初始化完成
+      end
+   end
+ end
+			
+////iic需要配置的寄存器值  			
+always@(reg_index)   
+ begin
+    case(reg_index)
+	 0    :reg_data   <=24'h310311 ;//      
+	 1    :reg_data   <=24'h300882 ;//      
+
+	 102  :reg_data   <=24'h300842 ;//      
+	 103  :reg_data   <=24'h310303 ;//      
+	 104  :reg_data   <=24'h3017ff ;//      
+	 105  :reg_data   <=24'h3018ff ;//      
+	 106  :reg_data   <=24'h30341A ;//      
+	 107  :reg_data   <=24'h303713 ;//      
+	 108  :reg_data   <=24'h310801 ;//      
+	 109  :reg_data   <=24'h363036 ;//      
+	 110  :reg_data  <=24'h36310e ;//       
+	 111  :reg_data  <=24'h3632e2 ;//       
+	 112  :reg_data  <=24'h363312 ;//       
+	 113  :reg_data  <=24'h3621e0 ;//       
+	 114  :reg_data  <=24'h3704a0 ;//       
+	 115  :reg_data  <=24'h37035a ;//       
+	 116  :reg_data  <=24'h371578 ;//       
+	 117  :reg_data  <=24'h371701 ;//       
+	 118  :reg_data  <=24'h370b60 ;//       
+	 119  :reg_data  <=24'h37051a ;//       
+	 120  :reg_data  <=24'h390502 ;//       
+	 121  :reg_data  <=24'h390610 ;//       
+	 122  :reg_data  <=24'h39010a ;//       
+	 123  :reg_data  <=24'h373112 ;//       
+	 124  :reg_data  <=24'h360008 ;//       
+	 125  :reg_data  <=24'h360133 ;//       
+	 126  :reg_data  <=24'h302d60 ;//       
+	 127  :reg_data  <=24'h362052 ;//       
+	 128  :reg_data  <=24'h371b20 ;//       
+	 129  :reg_data  <=24'h471c50 ;//       
+	 130  :reg_data  <=24'h3a1343 ;//       
+	 131  :reg_data  <=24'h3a1800 ;//       
+	 132  :reg_data  <=24'h3a19f8 ;//       
+	 133  :reg_data  <=24'h363513 ;//       
+	 134  :reg_data  <=24'h363603 ;//       
+	 135  :reg_data  <=24'h363440 ;//       
+	 136  :reg_data  <=24'h362201 ;///      
+	 137  :reg_data  <=24'h3c0134 ;//       
+	 138  :reg_data  <=24'h3c0428 ;//       
+	 139  :reg_data  <=24'h3c0598 ;//       
+	 140  :reg_data  <=24'h3c0600 ;//       
+     141  :reg_data  <=24'h3c0708 ;//       
+	 142  :reg_data  <=24'h3c0800 ;//       
+	 143  :reg_data  <=24'h3c091c ;//       
+	 144  :reg_data  <=24'h3c0a9c ;//       
+	 145  :reg_data  <=24'h3c0b40 ;//       
+	 146  :reg_data  <=24'h381000 ;//       
+	 147  :reg_data  <=24'h381110 ;//       
+	 148  :reg_data  <=24'h381200 ;//       
+	 149  :reg_data  <=24'h370864 ;//       
+	 150  :reg_data  <=24'h400102 ;//       
+	 151  :reg_data  <=24'h40051a ;//       
+	 152  :reg_data  <=24'h300000 ;//       
+	 153  :reg_data  <=24'h3004ff ;//       
+	 154  :reg_data  <=24'h300e58 ;//       
+	 155  :reg_data  <=24'h302e00 ;//       
+	 156  :reg_data  <=24'h430060 ;//       
+	 157  :reg_data  <=24'h501f01 ;//       
+	 158  :reg_data  <=24'h440e00 ;//       
+	 159  :reg_data  <=24'h5000a7 ;//     
+	 160  :reg_data  <=24'h3a0f30 ;//       
+	 161  :reg_data  <=24'h3a1028 ;//       
+	 162  :reg_data  <=24'h3a1b30 ;//       
+	 163  :reg_data  <=24'h3a1e26 ;//       
+	 164  :reg_data  <=24'h3a1160 ;//       
+	 165  :reg_data  <=24'h3a1f14 ;//       
+	 166  :reg_data  <=24'h580023 ;//       
+	 167  :reg_data  <=24'h580114 ;//       
+	 168  :reg_data  <=24'h58020f ;//       
+	 169  :reg_data  <=24'h58030f ;//       
+	 170  :reg_data  <=24'h580412 ;//       
+	 171  :reg_data  <=24'h580526 ;//       
+	 172  :reg_data  <=24'h58060c ;//       
+	 173  :reg_data  <=24'h580708 ;//       
+	 174  :reg_data  <=24'h580805 ;//       
+	 175  :reg_data  <=24'h580905 ;//       
+	 176  :reg_data  <=24'h580a08 ;//       
+	 177  :reg_data  <=24'h580b0d ;//       
+	 178  :reg_data  <=24'h580c08 ;//       
+	 179  :reg_data  <=24'h580d03 ;//       
+	 180  :reg_data  <=24'h580e00 ;//       
+	 181  :reg_data  <=24'h580f00 ;//       
+	 182  :reg_data  <=24'h581003 ;//       
+	 183  :reg_data  <=24'h581109 ;//       
+	 184  :reg_data  <=24'h581207 ;//       
+	 185  :reg_data  <=24'h581303 ;//       
+	 186  :reg_data  <=24'h581400 ;//       
+	 187  :reg_data  <=24'h581501 ;//       
+	 188  :reg_data  <=24'h581603 ;//       
+	 189  :reg_data  <=24'h581708 ;//       
+	 190  :reg_data  <=24'h58180d ;//       
+	 191  :reg_data  <=24'h581908 ;//       
+	 192  :reg_data  <=24'h581a05 ;//       
+	 193  :reg_data  <=24'h581b06 ;//       
+	 194  :reg_data  <=24'h581c08 ;//       
+	 195  :reg_data  <=24'h581d0e ;//       
+	 196  :reg_data  <=24'h581e29 ;//       
+	 197  :reg_data  <=24'h581f17 ;//       
+	 198  :reg_data  <=24'h582011 ;//       
+	 199  :reg_data  <=24'h582111 ;//       
+	 200  :reg_data <=24'h582215 ;//        
+	 201  :reg_data <=24'h582328 ;//        
+	 202  :reg_data <=24'h582446 ;//        
+	 203  :reg_data <=24'h582526 ;//        
+	 204  :reg_data <=24'h582608 ;//        
+	 205  :reg_data <=24'h582726 ;//        
+	 206  :reg_data <=24'h582864 ;//        
+	 207  :reg_data <=24'h582926 ;//        
+	 208  :reg_data <=24'h582a24 ;//        
+	 209  :reg_data <=24'h582b22 ;//        
+	 210  :reg_data <=24'h582c24 ;//        
+	 211  :reg_data <=24'h582d24 ;//        
+	 212  :reg_data <=24'h582e06 ;//        
+	 213  :reg_data <=24'h582f22 ;//        
+	 214  :reg_data <=24'h583040 ;//        
+	 215  :reg_data <=24'h583142 ;//        
+	 216  :reg_data <=24'h583224 ;//        
+	 217  :reg_data <=24'h583326 ;//        
+	 218  :reg_data <=24'h583424 ;//        
+	 219  :reg_data <=24'h583522 ;//        
+	 220  :reg_data <=24'h583622 ;//        
+	 221  :reg_data <=24'h583726 ;//        
+	 222  :reg_data <=24'h583844 ;//        
+	 223  :reg_data <=24'h583924 ;//        
+	 224  :reg_data <=24'h583a26 ;//        
+	 225  :reg_data <=24'h583b28 ;//        
+	 226  :reg_data <=24'h583c42 ;//        
+	 227  :reg_data <=24'h583dce ;//        
+	 228  :reg_data <=24'h5180ff ;//        
+	 229  :reg_data <=24'h5181f2 ;//        
+	 230  :reg_data <=24'h518200 ;//        
+	 231  :reg_data <=24'h518314 ;//        
+	 232  :reg_data <=24'h518425 ;//        
+	 233  :reg_data <=24'h518524 ;//        
+	 234  :reg_data <=24'h518609 ;//        
+	 235  :reg_data <=24'h518709 ;//        
+	 236  :reg_data <=24'h518809 ;//        
+	 237  :reg_data <=24'h518975 ;//        
+	 238  :reg_data <=24'h518a54 ;//        
+	 239  :reg_data <=24'h518be0 ;//        
+	 240  :reg_data <=24'h518cb2 ;//        
+	 241  :reg_data <=24'h518d42 ;//        
+	 242  :reg_data <=24'h518e3d ;//        
+	 243  :reg_data <=24'h518f56 ;//        
+	 244  :reg_data <=24'h519046 ;//        
+	 245  :reg_data <=24'h5191f8 ;//        
+	 246  :reg_data <=24'h519204 ;//        
+	 247  :reg_data <=24'h519370 ;//        
+	 248  :reg_data <=24'h5194f0 ;//        
+	 249  :reg_data <=24'h5195f0 ;//        
+	 250  :reg_data <=24'h519603 ;//        
+	 251  :reg_data <=24'h519701 ;//        
+	 252  :reg_data <=24'h519804 ;//        
+	 253  :reg_data <=24'h519912 ;//        
+	 254  :reg_data <=24'h519a04 ;//        
+	 255  :reg_data <=24'h519b00 ;//        
+	 256  :reg_data <=24'h519c06 ;//        
+	 257  :reg_data <=24'h519d82 ;//        
+	 258  :reg_data <=24'h519e38 ;//        
+	 259  :reg_data <=24'h548001 ;//        
+	 260  :reg_data <=24'h548108 ;//        
+	 261  :reg_data <=24'h548214 ;//        
+	 262  :reg_data <=24'h548328 ;//        
+	 263  :reg_data <=24'h548451 ;//        
+	 264  :reg_data <=24'h548565 ;//        
+	 265  :reg_data <=24'h548671 ;//        
+	 266  :reg_data <=24'h54877d ;//        
+	 267  :reg_data <=24'h548887 ;//        
+	 268  :reg_data <=24'h548991 ;//        
+	 269  :reg_data <=24'h548a9a ;//        
+	 270  :reg_data <=24'h548baa ;//        
+	 271  :reg_data <=24'h548cb8 ;//        
+	 272  :reg_data <=24'h548dcd ;//        
+	 273  :reg_data <=24'h548edd ;//        
+	 274  :reg_data <=24'h548fea ;//        
+	 275  :reg_data <=24'h54901d ;//        
+	 276  :reg_data <=24'h53811e ;//        
+	 277  :reg_data <=24'h53825b ;//        
+	 278  :reg_data <=24'h538308 ;//        
+	 279  :reg_data <=24'h53840a ;//        
+	 280  :reg_data <=24'h53857e ;//        
+	 281  :reg_data <=24'h538688 ;//        
+	 282  :reg_data <=24'h53877c ;//        
+	 283  :reg_data <=24'h53886c ;//        
+	 284  :reg_data <=24'h538910 ;//        
+	 285  :reg_data <=24'h538a01 ;//        
+	 286  :reg_data <=24'h538b98 ;//       
+	 287  :reg_data <=24'h558006 ;//        
+	 288  :reg_data <=24'h558340 ;//        
+	 289  :reg_data <=24'h558410 ;//        
+	 290  :reg_data <=24'h558910 ;//        
+	 291  :reg_data <=24'h558a00 ;//        
+	 292  :reg_data <=24'h558bf8 ;//        
+	 293  :reg_data <=24'h501d40 ;//        
+	 294  :reg_data <=24'h530008 ;//        
+	 295  :reg_data <=24'h530130 ;//        
+	 296  :reg_data <=24'h530210 ;//        
+	 297  :reg_data <=24'h530300 ;//        
+	 298  :reg_data <=24'h530408 ;//        
+	 299  :reg_data <=24'h530530 ;//        
+	 300  :reg_data <=24'h530608 ;//        
+	 301  :reg_data <=24'h530716 ;//        
+	 302  :reg_data <=24'h530908 ;//        
+	 303  :reg_data <=24'h530a30 ;//        
+	 304  :reg_data <=24'h530b04 ;//        
+	 305  :reg_data <=24'h530c06 ;//        
+	 306  :reg_data <=24'h502500 ;//        
+	 307  :reg_data <=24'h300802 ;//       
+  //720 30帧/秒, night mode 5fps ;//         
+  //input clock=24Mhz,PCLK=84Mhz ;//         
+	 308  :reg_data <=24'h303521 ;//PLL      
+	 309  :reg_data <=24'h303669 ;//PLL     
+     310  :reg_data <=24'h3c0708 ;//        
+	 311  :reg_data <=24'h382047 ;//        
+	 312  :reg_data <=24'h382100 ;//        
+	 313  :reg_data <=24'h381431 ;//        
+	 314  :reg_data <=24'h381531 ;//        
+	 315  :reg_data <=24'h380000 ;//        
+	 316  :reg_data <=24'h380100 ;//        
+	 317  :reg_data <=24'h380200 ;//        
+	 318  :reg_data <=24'h3803fa ;//        
+	 319  :reg_data <=24'h38040a ;//        
+	 320  :reg_data <=24'h38053f ;//        
+	 321  :reg_data <=24'h380606 ;//        
+	 322  :reg_data <=24'h3807a9 ;//        
+	 323  :reg_data <=24'h380805 ;//        
+	 324  :reg_data <=24'h380900 ;//        
+	 325  :reg_data <=24'h380a02 ;//        
+	 326  :reg_data <=24'h380bd0 ;//        
+	 327  :reg_data <=24'h380c07 ;//        
+	 328  :reg_data <=24'h380d64 ;//        
+	 329  :reg_data <=24'h380e02 ;//        
+	 330  :reg_data <=24'h380fe4 ;//        
+	 331  :reg_data <=24'h381304 ;//        
+	 332  :reg_data <=24'h361800 ;//        
+	 333  :reg_data <=24'h361229 ;//        
+	 334  :reg_data <=24'h370952 ;//        
+	 335  :reg_data <=24'h370c03 ;//        
+	 336  :reg_data <=24'h3a0202 ;//        
+	 337  :reg_data <=24'h3a03e0 ;//        
+
+	 338  :reg_data <=24'h3a0800 ;//        
+	 339  :reg_data <=24'h3a096f ;//        
+	 340  :reg_data <=24'h3a0a00 ;//        
+	 341  :reg_data <=24'h3a0b5c ;//        
+	 342  :reg_data <=24'h3a0e06 ;//        
+	 343  :reg_data <=24'h3a0d08 ;//        
+	 344  :reg_data <=24'h3a1402 ;//         
+	 345  :reg_data <=24'h3a15e0 ;//         
+	 346  :reg_data <=24'h400402 ;//         
+	 347  :reg_data <=24'h30021c ;//         
+	 348  :reg_data <=24'h3006c3 ;//         
+	 349  :reg_data <=24'h471303 ;//         
+	 350  :reg_data <=24'h440704 ;//         
+	 351  :reg_data <=24'h460b37 ;//           
+     352  :reg_data <=24'h460c20 ;//          
+	 353  :reg_data <=24'h483716 ;//         
+	 354  :reg_data <=24'h382404 ;//         
+	 355  :reg_data <=24'h500183 ;//         
+	 356  :reg_data <=24'h350300 ;//         
+	 default:reg_data<=24'hffffff;//        
+    endcase      
+end	 
+
+
+endmodule
+
+
+//-----------------------------------------------------------------------------
+// module i2c_com   (from official 10_HDMI_DDR3_OV5640_test, used by reg_config)
+//-----------------------------------------------------------------------------
+//////////////////////////////////////////////////////////////////////////////////
+// Company:Meyesemi 
+// Engineer: Will
+// 
+// Create Date: 2023-03-17  
+// Design Name:  
+// Module Name: 
+// Project Name: 
+// Target Devices: Pango
+// Tool Versions: 
+// Description: 
+//      
+// Dependencies: 
+// 
+// Revision:
+// Revision 1.0 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+//sclk，sdin数据传输时序代码（i2c写控制代码）
+module i2c_com(clock_i2c        ,  //i2c控制接口传输所需时钟，0-400khz，此处为20khz
+               camera_rstn      ,     
+               ack              ,  //应答信号
+               i2c_data         ,  //sdin接口传输的32位数据
+               start            ,  //开始传输标志
+               tr_end           ,  //传输结束标志
+               i2c_sclk         ,  //FPGA与camera iic时钟接口
+               i2c_sdat            //FPGA与camera iic数据接口
+);        
+    input [31:0]i2c_data;
+    input camera_rstn;
+    input clock_i2c;
+    output ack;
+    input start;
+    output tr_end;
+    output i2c_sclk;
+    inout i2c_sdat;
+    reg [5:0] cyc_count;
+    reg reg_sdat;
+    reg sclk;
+    reg ack1,ack2,ack3;
+    reg tr_end;
+ 
+   
+    wire i2c_sclk;
+    wire i2c_sdat;
+    wire ack;
+   
+    assign ack=ack1|ack2|ack3;
+    assign i2c_sclk=sclk|(((cyc_count>=4)&(cyc_count<=39))?~clock_i2c:0);
+    assign i2c_sdat=reg_sdat?1'bz:0; 
+   
+    always@(posedge clock_i2c)
+    begin
+       if(!camera_rstn)
+         cyc_count<=6'b111111;
+       else 
+		   begin
+           if(start==0)
+             cyc_count<=0;
+           else if(cyc_count<6'b111111)
+             cyc_count<=cyc_count+1;
+         end
+    end
+	 
+	 
+    always@(posedge clock_i2c)
+    begin
+       if(!camera_rstn)
+       begin
+          tr_end<=0;
+          ack1<=1;
+          ack2<=1;
+          ack3<=1;
+          sclk<=1;
+          reg_sdat<=1;
+       end
+       else
+          case(cyc_count)
+          0:begin ack1<=1;ack2<=1;ack3<=1;tr_end<=0;sclk<=1;reg_sdat<=1;end
+          1:reg_sdat<=0;                 //开始传输
+          2:sclk<=0;
+          3:reg_sdat<=i2c_data[31];
+          4:reg_sdat<=i2c_data[30];
+          5:reg_sdat<=i2c_data[29];
+          6:reg_sdat<=i2c_data[28];
+          7:reg_sdat<=i2c_data[27];
+          8:reg_sdat<=i2c_data[26];
+          9:reg_sdat<=i2c_data[25];
+          10:reg_sdat<=i2c_data[24];
+          11:reg_sdat<=1;                //应答信号
+          12:begin reg_sdat<=i2c_data[23];ack1<=i2c_sdat;end
+          13:reg_sdat<=i2c_data[22];
+          14:reg_sdat<=i2c_data[21];
+          15:reg_sdat<=i2c_data[20];
+          16:reg_sdat<=i2c_data[19];
+          17:reg_sdat<=i2c_data[18];
+          18:reg_sdat<=i2c_data[17];
+          19:reg_sdat<=i2c_data[16];
+          20:reg_sdat<=1;                //应答信号       
+          21:begin reg_sdat<=i2c_data[15];ack1<=i2c_sdat;end
+          22:reg_sdat<=i2c_data[14];
+          23:reg_sdat<=i2c_data[13];
+          24:reg_sdat<=i2c_data[12];
+          25:reg_sdat<=i2c_data[11];
+          26:reg_sdat<=i2c_data[10];
+          27:reg_sdat<=i2c_data[9];
+          28:reg_sdat<=i2c_data[8];
+          29:reg_sdat<=1;                //应答信号       
+          30:begin reg_sdat<=i2c_data[7];ack2<=i2c_sdat;end
+          31:reg_sdat<=i2c_data[6];
+          32:reg_sdat<=i2c_data[5];
+          33:reg_sdat<=i2c_data[4];
+          34:reg_sdat<=i2c_data[3];
+          35:reg_sdat<=i2c_data[2];
+          36:reg_sdat<=i2c_data[1];
+          37:reg_sdat<=i2c_data[0];
+          38:reg_sdat<=1;                //应答信号       
+          39:begin ack3<=i2c_sdat;sclk<=0;reg_sdat<=0;end
+          40:sclk<=1;
+          41:begin reg_sdat<=1;tr_end<=1;end
+          endcase
+       
+end
+
+endmodule
+
+
+//=============================================================================
+// module mosaic_wr  --  双摄像头左右同屏合成器（2026-10-28 新增）
+//
+//   ★ 目标：把两颗 1280x720 摄像头合成【一帧】1280x720：
+//       左 640 像素 = cam1（水平 2:1 抽稀）
+//       右 640 像素 = cam2（水平 2:1 抽稀）
+//     然后送给【单个】fram_buf -> 完全不需要 AXI 仲裁器。
+//
+//   ★ 为什么可以不按摄像头真实时序：
+//     fram_buf 内部的 wr_buf 只看三件事：
+//       1) wr_fsync 出现一次上升沿（置 wr_enable）
+//       2) 每行 wr_en 连续高 >= H_NUM-20 拍（本例 1280 拍）
+//       3) 行间 wr_en 低 >= 1 拍（复位 x_cnt、产生 y_cnt 上升沿）
+//     所以写器可以用独立的 sys_clk(50MHz) 自由跑，不必跟着摄像头时钟。
+//     好处：彻底消除"时钟二选一 mux"带来的稳定性隐患。
+//
+//   ★ 防死锁：以 cam1 的行节拍为主。cam2 用"最新可用 bank"，
+//     如果 cam2 还没更新就重复上一行。任何一颗停了都不会卡住整条链。
+//
+//   ★ 每段行内：o_de 连续高 1280 拍，数据按 左640 + 右640 顺序输出。
+//     行间 o_de 拉低 1 拍。每 V_NUM 行发一次 o_fsync。
+
+//=============================================================================
+// module quad_wr  --  四路视频合成写器（2026-10-28 新增）
+//
+//   ★ 目标：把一帧 1920x1080 的合成画面写进 fram_buf，其中
+//       上半屏 1920x540  = HDMI 输入原样（电脑播放"左上视频1 + 右上视频2"）
+//       下半屏 1920x540  = 左 960 = cam1 缩放，右 960 = cam2 缩放
+//
+//   ★ 为什么写侧这么简单：
+//       HDMI 的 de 天然就是"每行恰好 1920 拍高 + 消隐低"，正好满足 wr_buf 的
+//       三个硬要求（每行连续 >= H_NUM-20 拍 / 行间低 >=1 拍 / 每帧一次 fsync 上升沿）。
+//       所以 o_de 直接等于 hd_de，不需要任何额外时序生成。
+//
+//   ★ 摄像头缩放（Bresenham 累积器，不用除法器）：
+//       水平：源行宽 src_w（由写侧实测并锁存）→ 960 个输出像素
+//             输出第 i 个像素对应的源索引 = floor(i * src_w / 960)
+//       垂直：固定 3/4（720 行 → 540 行，每 4 行丢 1 行）
+//       这样无论摄像头实际是 1280x720 还是 640x480，横向都能铺满 960，不会留陈旧列。
+//
+//   ★ 跨时钟域：
+//       摄像头行缓存写在 cam 时钟域，本模块在 HDMI 时钟域读。
+//       用"行就绪翻转标志 + 2 级同步 + 边沿检测"跨域，与已验证的双摄同屏完全相同。
+//
+//   ★ 安全性：cam 时钟停了也不会卡死 —— 一直重复上一行。
+//=============================================================================
+module quad_wr #(
+    parameter integer H_LINE   = 1920,   // 合成行宽
+    parameter integer V_HALF   = 540,    // 上下半分界
+    parameter integer H_CELL   = 960,    // 每格宽 = 行缓存深度
+    parameter integer LB_AW    = 10      // 行缓存地址位宽（H_CELL <= 1024）
+)(
+    input  wire        hd_clk,      // HDMI 像素时钟 pixclk_in
+    input  wire        rst_n,
+    input  wire        hd_de,       // HDMI 数据有效
+    input  wire [15:0] hd_pix,      // HDMI RGB565
+    input  wire        hd_vs,       // HDMI 自造场同步
+    // 摄像头 1
+    input  wire        c1_clk,
+    input  wire        c1_de,
+    input  wire        c1_vs,
+    input  wire [15:0] c1_pix,
+    // 摄像头 2
+    input  wire        c2_clk,
+    input  wire        c2_de,
+    input  wire        c2_vs,
+    input  wire [15:0] c2_pix,
+    // 输出（hd_clk 域）
+    output reg         o_de,
+    output reg  [15:0] o_pix,
+    output reg         o_fsync,
+    // 诊断
+    output wire [15:0] dbg_srcw1,
+    output wire [15:0] dbg_srcw2,
+    output wire [15:0] dbg_srch1,
+    output wire [15:0] dbg_srch2
+);
+
+    //==========================================================================
+    // 一、HDMI 侧坐标计数（只用 de，不依赖 vs/hs）
+    //==========================================================================
+    reg [11:0] hd_x, hd_y;
+    reg        hd_de_d;
+
+    always @(posedge hd_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            hd_x <= 12'd0; hd_y <= 12'd0; hd_de_d <= 1'b0;
+        end else begin
+            hd_de_d <= hd_de;
+            if (hd_de) begin
+                if (hd_x == H_LINE-1) begin
+                    hd_x <= 12'd0;
+                    hd_y <= (hd_y == 12'd1079) ? 12'd0 : hd_y + 12'd1;
+                end else hd_x <= hd_x + 12'd1;
+            end
+            if (hd_vs) hd_y <= 12'd0;
+        end
+    end
+
+    //==========================================================================
+    // 二、行缓存：每颗 2 bank x H_CELL x 16bit
+    //     写侧做 3/4 水平抽稀（1280 -> 960），读侧直接按 hd_x 索引
+    //     结构完全照搬已验证的 mosaic_wr，只把 1/2 改成 3/4
+    //==========================================================================
+    reg [15:0] lb1 [0:(2<<LB_AW)-1];   // 2 bank x (1<<LB_AW)，bank 必须是 2 的幂
+    reg [15:0] lb2 [0:(2<<LB_AW)-1];
+
+    //------------------------------ cam1 --------------------------------------
+    reg [1:0]  c1_cnt;          // 0,1,2 写 ; 3 跳过  -> 1280*3/4 = 960
+    reg [3:0]  c1_vcnt;         // 垂直：0,1,2 保留 ; 3 跳过 -> 720*3/4 = 540
+    reg [LB_AW-1:0] c1_waddr;
+    reg        c1_de_d, c1_vs_d;
+    reg        c1_bank, c1_rdy_tgl;
+    reg [11:0] c1_srcw, c1_flines, c1_srch;
+    reg [11:0] c1_pixcnt;        // 本行源像素数（诊断用）
+    // ★ 行结束滤波：de 必须持续低 64 拍才算一行结束，一行只产生一次脉冲
+    //   （原来直接用 de 下降沿，若 de 抖动会多次触发 -> bank 反复切换 -> 画面出现多份重复）
+    reg [6:0] c1_low_cnt;
+    always @(posedge c1_clk or negedge rst_n) begin
+        if (!rst_n)                    c1_low_cnt <= 7'd0;
+        else if (c1_de)                c1_low_cnt <= 7'd0;
+        else if (c1_low_cnt != 7'd127) c1_low_cnt <= c1_low_cnt + 7'd1;
+    end
+    wire c1_line_end = (c1_low_cnt == 7'd63);
+    wire       c1_vs_rise  = c1_vs & ~c1_vs_d;
+    wire       c1_vkeep    = (c1_vcnt != 4'd3);      // 垂直 3/4
+
+    always @(posedge c1_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            c1_de_d <= 1'b0; c1_vs_d <= 1'b0;
+            c1_cnt  <= 2'd0; c1_vcnt <= 4'd0;
+            c1_waddr<= {LB_AW{1'b0}};
+            c1_srcw <= 12'd0; c1_flines <= 12'd0; c1_srch <= 12'd0;
+        end else begin
+            c1_de_d <= c1_de;
+            c1_vs_d <= c1_vs;
+            if (!c1_de) begin
+                c1_cnt   <= 2'd0;
+                c1_waddr <= {LB_AW{1'b0}};
+                c1_pixcnt<= 12'd0;
+            end else begin
+                c1_cnt <= c1_cnt + 2'd1;
+                c1_pixcnt<= c1_pixcnt + 12'd1;
+                if ((c1_cnt != 2'd3) && c1_vkeep && (c1_waddr < H_CELL-1))
+                    c1_waddr <= c1_waddr + 1'b1;
+            end
+            if (c1_line_end) begin
+                c1_vcnt   <= (c1_vcnt == 4'd3) ? 4'd0 : c1_vcnt + 4'd1;
+                c1_srcw   <= c1_pixcnt;
+                c1_flines <= c1_flines + 12'd1;
+            end
+            if (c1_vs_rise) begin
+                c1_srch   <= c1_flines;
+                c1_flines <= 12'd0;
+            end
+        end
+    end
+
+    // 写使能：不在第 4 个像素、垂直保留行、地址未越界
+    wire c1_wr_en = c1_de & (c1_cnt != 2'd3) & c1_vkeep & (c1_waddr < H_CELL);   // 允许写 0..959
+
+    always @(posedge c1_clk) begin
+        if (c1_wr_en) lb1[{c1_bank, c1_waddr}] <= c1_pix;
+    end
+
+    always @(posedge c1_clk or negedge rst_n) begin
+        if (!rst_n) begin c1_bank <= 1'b0; c1_rdy_tgl <= 1'b0; end
+        else if (c1_line_end && c1_vkeep) begin
+            c1_bank    <= ~c1_bank;
+            c1_rdy_tgl <= ~c1_rdy_tgl;
+        end
+    end
+
+    //------------------------------ cam2 --------------------------------------
+    reg [1:0]  c2_cnt;
+    reg [3:0]  c2_vcnt;
+    reg [LB_AW-1:0] c2_waddr;
+    reg        c2_de_d, c2_vs_d;
+    reg        c2_bank, c2_rdy_tgl;
+    reg [11:0] c2_srcw, c2_flines, c2_srch;
+    reg [11:0] c2_pixcnt;
+    reg [6:0] c2_low_cnt;
+    always @(posedge c2_clk or negedge rst_n) begin
+        if (!rst_n)                    c2_low_cnt <= 7'd0;
+        else if (c2_de)                c2_low_cnt <= 7'd0;
+        else if (c2_low_cnt != 7'd127) c2_low_cnt <= c2_low_cnt + 7'd1;
+    end
+    wire c2_line_end = (c2_low_cnt == 7'd63);
+    wire       c2_vs_rise  = c2_vs & ~c2_vs_d;
+    wire       c2_vkeep    = (c2_vcnt != 4'd3);
+
+    always @(posedge c2_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            c2_de_d <= 1'b0; c2_vs_d <= 1'b0;
+            c2_cnt  <= 2'd0; c2_vcnt <= 4'd0;
+            c2_waddr<= {LB_AW{1'b0}};
+            c2_srcw <= 12'd0; c2_flines <= 12'd0; c2_srch <= 12'd0;
+        end else begin
+            c2_de_d <= c2_de;
+            c2_vs_d <= c2_vs;
+            if (!c2_de) begin
+                c2_cnt   <= 2'd0;
+                c2_waddr <= {LB_AW{1'b0}};
+                c2_pixcnt<= 12'd0;
+            end else begin
+                c2_cnt <= c2_cnt + 2'd1;
+                c2_pixcnt<= c2_pixcnt + 12'd1;
+                if ((c2_cnt != 2'd3) && c2_vkeep && (c2_waddr < H_CELL-1))
+                    c2_waddr <= c2_waddr + 1'b1;
+            end
+            if (c2_line_end) begin
+                c2_vcnt   <= (c2_vcnt == 4'd3) ? 4'd0 : c2_vcnt + 4'd1;
+                c2_srcw   <= c2_pixcnt;
+                c2_flines <= c2_flines + 12'd1;
+            end
+            if (c2_vs_rise) begin
+                c2_srch   <= c2_flines;
+                c2_flines <= 12'd0;
+            end
+        end
+    end
+
+    wire c2_wr_en = c2_de & (c2_cnt != 2'd3) & c2_vkeep & (c2_waddr < H_CELL);   // 允许写 0..959
+
+    always @(posedge c2_clk) begin
+        if (c2_wr_en) lb2[{c2_bank, c2_waddr}] <= c2_pix;
+    end
+
+    always @(posedge c2_clk or negedge rst_n) begin
+        if (!rst_n) begin c2_bank <= 1'b0; c2_rdy_tgl <= 1'b0; end
+        else if (c2_line_end && c2_vkeep) begin
+            c2_bank    <= ~c2_bank;
+            c2_rdy_tgl <= ~c2_rdy_tgl;
+        end
+    end
+
+    //==========================================================================
+    // 三、跨到 hd_clk 域：bank 必须锁存【翻转前】的值
+    //     （这是已验证版的写法：rb*_hold 与 rb* 同拍更新，
+    //       rb*_hold 拿到的是旧值 -> 正是刚写完的那个 bank）
+    //==========================================================================
+    reg [2:0] c1_rdy_s, c2_rdy_s;
+    always @(posedge hd_clk or negedge rst_n) begin
+        if (!rst_n) begin c1_rdy_s <= 3'd0; c2_rdy_s <= 3'd0; end
+        else begin
+            c1_rdy_s <= {c1_rdy_s[1:0], c1_rdy_tgl};
+            c2_rdy_s <= {c2_rdy_s[1:0], c2_rdy_tgl};
+        end
+    end
+    wire c1_new = (c1_rdy_s[2:1] == 2'b01);
+    wire c2_new = (c2_rdy_s[2:1] == 2'b01);
+
+    reg rb1, rb2, rb1_hold, rb2_hold;
+    always @(posedge hd_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rb1 <= 1'b0; rb2 <= 1'b0;
+            rb1_hold <= 1'b0; rb2_hold <= 1'b0;
+        end else begin
+            if (c1_new) begin rb1_hold <= rb1; rb1 <= ~rb1; end
+            if (c2_new) begin rb2_hold <= rb2; rb2 <= ~rb2; end
+        end
+    end
+
+    //==========================================================================
+    // 四、像素读取：直接按坐标索引，无累积器
+    //     hd_x 0..959   -> lb1[hd_x]
+    //     hd_x 960..1919 -> lb2[hd_x-960]
+    //     行缓存读是寄存器输出，所以坐标要延迟 1 拍对齐
+    //==========================================================================
+    wire [11:0] cx = (hd_x >= H_CELL) ? (hd_x - H_CELL) : hd_x;
+    wire [LB_AW-1:0] cxa = cx[LB_AW-1:0];
+
+    // 输出对齐用的延迟寄存器（BRAM 读是寄存器输出，坐标要同步延迟 1 拍）
+    reg        hd_de_d2;
+    reg [11:0] hd_x_d, hd_y_d;
+    reg [15:0] hd_pix_d;
+
+    reg [15:0] px1, px2;
+    always @(posedge hd_clk) begin
+        px1 <= lb1[{rb1_hold, cxa}];
+        px2 <= lb2[{rb2_hold, cxa}];
+    end
+
+    always @(posedge hd_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            o_de <= 1'b0; o_pix <= 16'd0; o_fsync <= 1'b0;
+            hd_de_d2 <= 1'b0; hd_x_d <= 12'd0; hd_y_d <= 12'd0; hd_pix_d <= 16'd0;
+        end else begin
+            hd_de_d2 <= hd_de;
+            hd_x_d   <= hd_x;
+            hd_y_d   <= hd_y;
+            hd_pix_d <= hd_pix;
+            o_de     <= hd_de_d2;      // 与 px1/px2 同延迟
+            o_fsync  <= hd_vs;
+            if (hd_y_d < V_HALF)
+                o_pix <= hd_pix_d;                              // 上半屏：HDMI
+            else
+                o_pix <= (hd_x_d < H_CELL) ? px1 : px2;         // 下半屏：摄像头
+        end
+    end
+
+    //==========================================================================
+    // 诊断
+    //==========================================================================
+    assign dbg_srcw1 = {4'd0, c1_srcw};
+    assign dbg_srcw2 = {4'd0, c2_srcw};
+    assign dbg_srch1 = {4'd0, c1_srch};
+    assign dbg_srch2 = {4'd0, c2_srch};
+
+endmodule
+
+//=============================================================================
+// module mosaic_wr2  --  双摄合成写器 v2（2026-10-28 新增，移植 19:44 验证版）
+//
+//   ★ 与 quad_wr 的区别：数据进【framebuf 整帧缓存】，不是 HDMI 行缓存。
+//     摄像头 30fps / 显示 60fps，行缓存只能存 1 行 -> 垂直必然漂移；
+//     整帧缓存在 DDR3 里才不漂移（19:44 验证版就是这么做的）。
+//
+//   ★ 结构照搬验证版：cam 时钟域双 bank 行缓存 + 行就绪翻转跨域 + FSM
+//     只改：水平抽稀 2:1 -> 3:4（2 位计数器，无累积器），H_HALF 640->960
+//=============================================================================
+module mosaic_wr2 #(
+    parameter integer H_HALF = 960,
+    parameter integer V_NUM  = 540
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire        c1_clk,
+    input  wire        c1_vs,
+    input  wire        c1_de,
+    input  wire [15:0] c1_pix,
+    input  wire        c2_clk,
+    input  wire        c2_de,
+    input  wire [15:0] c2_pix,
+    output reg         o_fsync,
+    output reg         o_de,
+    output reg  [15:0] o_pix,
+    output wire [15:0] dbg_srcw1,
+    output wire [15:0] dbg_srcw2
+);
+
+    reg [15:0] lb1 [0:2047];
+    reg [15:0] lb2 [0:2047];
+
+    //---- cam1 ----
+    reg [1:0]  c1_cnt;
+    reg [9:0]  c1_waddr;
+    reg        c1_de_d;
+    reg        c1_bank, c1_rdy_tgl;
+    reg [11:0] c1_pixcnt, c1_srcw;
+    wire       c1_line_end = c1_de_d & ~c1_de;
+
+    always @(posedge c1_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            c1_de_d  <= 1'b0;
+            c1_cnt   <= 2'd0;
+            c1_waddr <= 10'd0;
+            c1_pixcnt<= 12'd0;
+            c1_srcw  <= 12'd0;
+        end else begin
+            c1_de_d <= c1_de;
+            if (!c1_de) begin
+                c1_cnt    <= 2'd0;
+                c1_waddr  <= 10'd0;
+                c1_pixcnt <= 12'd0;
+            end else begin
+                c1_cnt    <= c1_cnt + 2'd1;
+                c1_pixcnt <= c1_pixcnt + 12'd1;
+                if ((c1_cnt != 2'd3) && (c1_waddr < H_HALF-1))
+                    c1_waddr <= c1_waddr + 10'd1;
+            end
+            if (c1_line_end) c1_srcw <= c1_pixcnt;
+        end
+    end
+
+    wire c1_wr_en = c1_de & (c1_cnt != 2'd3) & (c1_waddr < H_HALF);
+
+    always @(posedge c1_clk) begin
+        if (c1_wr_en) lb1[{c1_bank, c1_waddr}] <= c1_pix;
+    end
+
+    always @(posedge c1_clk or negedge rst_n) begin
+        if (!rst_n) begin c1_bank <= 1'b0; c1_rdy_tgl <= 1'b0; end
+        else if (c1_line_end) begin
+            c1_bank    <= ~c1_bank;
+            c1_rdy_tgl <= ~c1_rdy_tgl;
+        end
+    end
+
+    //---- cam2 ----
+    reg [1:0]  c2_cnt;
+    reg [9:0]  c2_waddr;
+    reg        c2_de_d;
+    reg        c2_bank, c2_rdy_tgl;
+    reg [11:0] c2_pixcnt, c2_srcw;
+    wire       c2_line_end = c2_de_d & ~c2_de;
+
+    always @(posedge c2_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            c2_de_d  <= 1'b0;
+            c2_cnt   <= 2'd0;
+            c2_waddr <= 10'd0;
+            c2_pixcnt<= 12'd0;
+            c2_srcw  <= 12'd0;
+        end else begin
+            c2_de_d <= c2_de;
+            if (!c2_de) begin
+                c2_cnt    <= 2'd0;
+                c2_waddr  <= 10'd0;
+                c2_pixcnt <= 12'd0;
+            end else begin
+                c2_cnt    <= c2_cnt + 2'd1;
+                c2_pixcnt <= c2_pixcnt + 12'd1;
+                if ((c2_cnt != 2'd3) && (c2_waddr < H_HALF-1))
+                    c2_waddr <= c2_waddr + 10'd1;
+            end
+            if (c2_line_end) c2_srcw <= c2_pixcnt;
+        end
+    end
+
+    wire c2_wr_en = c2_de & (c2_cnt != 2'd3) & (c2_waddr < H_HALF);
+
+    always @(posedge c2_clk) begin
+        if (c2_wr_en) lb2[{c2_bank, c2_waddr}] <= c2_pix;
+    end
+
+    always @(posedge c2_clk or negedge rst_n) begin
+        if (!rst_n) begin c2_bank <= 1'b0; c2_rdy_tgl <= 1'b0; end
+        else if (c2_line_end) begin
+            c2_bank    <= ~c2_bank;
+            c2_rdy_tgl <= ~c2_rdy_tgl;
+        end
+    end
+
+    //---- 跨到 clk 域 ----
+    reg [2:0] c1_rdy_s, c2_rdy_s;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin c1_rdy_s <= 3'd0; c2_rdy_s <= 3'd0; end
+        else begin
+            c1_rdy_s <= {c1_rdy_s[1:0], c1_rdy_tgl};
+            c2_rdy_s <= {c2_rdy_s[1:0], c2_rdy_tgl};
+        end
+    end
+    wire c1_line_new = (c1_rdy_s[2:1] == 2'b01);
+    wire c2_line_new = (c2_rdy_s[2:1] == 2'b01);
+
+    // ★ 加固1：读侧不用"翻转计数"，改用 bank 电平同步
+    //   原写法一旦 FSM 忙、错过 1 拍触发脉冲，rbank* 与 *_bank 就永久失步。
+    //   现在同步电平、读"正在写的相反那个"=刚写完的那个，永不失步。
+    reg [1:0] c1_bank_s, c2_bank_s;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin c1_bank_s <= 2'd0; c2_bank_s <= 2'd0; end
+        else begin
+            c1_bank_s <= {c1_bank_s[0], c1_bank};
+            c2_bank_s <= {c2_bank_s[0], c2_bank};
+        end
+    end
+    wire rbank1 = ~c1_bank_s[1];
+    wire rbank2 = ~c2_bank_s[1];
+
+    //---- cam1 VSYNC 同步 ----
+    reg [2:0] c1vs_s;
+    always @(posedge clk) c1vs_s <= {c1vs_s[1:0], c1_vs};
+    wire c1vs_rise = (c1vs_s[2:1] == 2'b01);
+
+    //---- 写器 FSM（照搬验证版）----
+    localparam S_WAIT = 2'd0,
+               S_C1   = 2'd1,
+               S_C2   = 2'd2,
+               S_GAP  = 2'd3;
+
+    // ★ 垂直 3/4 抽行：720 行摄像头 -> 540 行 framebuf
+    //   没有这个，FSM 每个摄像头行都写一行，720 行会绕回覆盖开头 ->
+    //   画面上下颠倒/被割成两半（就是之前看到的现象！）
+    reg [3:0] c1_vcnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) c1_vcnt <= 4'd0;
+        else if (c1_line_new) c1_vcnt <= (c1_vcnt == 4'd3) ? 4'd0 : c1_vcnt + 4'd1;
+    end
+    wire v_keep = (c1_vcnt != 4'd3);
+
+    reg [1:0]  st;
+    reg [11:0] line_cnt;
+    reg [9:0]  raddr;
+    reg        rb1_hold, rb2_hold;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            st       <= S_WAIT;
+            raddr    <= 10'd0;
+            line_cnt <= 12'd0;
+            o_de     <= 1'b0;
+            o_pix    <= 16'd0;
+            o_fsync  <= 1'b0;
+            rb1_hold <= 1'b0;
+            rb2_hold <= 1'b0;
+        end else begin
+            o_fsync <= c1vs_rise;
+            case (st)
+                S_WAIT: begin
+                    o_de <= 1'b0;
+                    if (c1_line_new && v_keep) begin
+                        rb1_hold <= rbank1;
+                        rb2_hold <= rbank2;
+                        raddr    <= 10'd0;
+                        st       <= S_C1;
+                    end
+                end
+                S_C1: begin
+                    o_de  <= 1'b1;
+                    o_pix <= lb1[{rb1_hold, raddr}];
+                    if (raddr == H_HALF-1) begin
+                        raddr <= 10'd0;
+                        st    <= S_C2;
+                    end else raddr <= raddr + 10'd1;
+                end
+                S_C2: begin
+                    o_de  <= 1'b1;
+                    o_pix <= lb2[{rb2_hold, raddr}];
+                    if (raddr == H_HALF-1) begin
+                        o_de <= 1'b0;
+                        st   <= S_GAP;
+                    end else raddr <= raddr + 10'd1;
+                end
+                S_GAP: begin
+                    o_de     <= 1'b0;
+                    line_cnt <= line_cnt + 12'd1;
+                    st       <= S_WAIT;
+                end
+                default: st <= S_WAIT;
+            endcase
+        end
+    end
+
+    assign dbg_srcw1 = {4'd0, c1_srcw};
+    assign dbg_srcw2 = {4'd0, c2_srcw};
+
+endmodule
+
+//=============================================================================
+// module hdmi_lb  --  HDMI 行缓存（2026-10-28 新增）
+//
+//   HDMI 输入 60fps / 显示 60fps，速率一致（只差晶振 0.04%），行缓存足够。
+//   双 bank + 就绪翻转跨域，与摄像头行缓存同一套已验证模式。
+//=============================================================================
+module hdmi_lb #(
+    parameter integer H_LINE = 1920
+)(
+    input  wire        wr_clk,
+    input  wire        wr_rst_n,
+    input  wire        wr_de,
+    input  wire [15:0] wr_pix,
+    input  wire        rd_clk,
+    input  wire        rd_rst_n,
+    input  wire [11:0] rd_x,
+    output reg  [15:0] rd_pix
+);
+
+    reg [15:0] mem [0:4095];        // 2 bank x 2048（bank 必须是 2 的幂）
+
+    reg [10:0] waddr;
+    reg        wbank, wrdy;
+    reg        wde_d;
+    wire       wline_end = wde_d & ~wr_de;
+
+    always @(posedge wr_clk or negedge wr_rst_n) begin
+        if (!wr_rst_n) begin
+            wde_d  <= 1'b0;
+            waddr  <= 11'd0;
+            wbank  <= 1'b0;
+            wrdy   <= 1'b0;
+        end else begin
+            wde_d <= wr_de;
+            if (!wr_de)    waddr <= 11'd0;
+            else if (waddr < H_LINE-1) waddr <= waddr + 11'd1;
+            if (wline_end) begin
+                wbank <= ~wbank;
+                wrdy  <= ~wrdy;
+            end
+        end
+    end
+
+    always @(posedge wr_clk) begin
+        if (wr_de) mem[{wbank, waddr}] <= wr_pix;
+    end
+
+    reg [2:0] rdy_s;
+    always @(posedge rd_clk or negedge rd_rst_n) begin
+        if (!rd_rst_n) rdy_s <= 3'd0;
+        else           rdy_s <= {rdy_s[1:0], wrdy};
+    end
+    wire line_new = (rdy_s[2:1] == 2'b01);
+
+    reg rbank, rbank_hold;
+    always @(posedge rd_clk or negedge rd_rst_n) begin
+        if (!rd_rst_n) begin rbank <= 1'b0; rbank_hold <= 1'b0; end
+        else if (line_new) begin
+            rbank_hold <= rbank;
+            rbank      <= ~rbank;
+        end
+    end
+
+    always @(posedge rd_clk) begin
+        rd_pix <= mem[{rbank_hold, rd_x[10:0]}];
+    end
+
+endmodule
+
+//=============================================================================
+// module compose_wr -- 全帧合成写器（2026-10-29 v3）
+//
+//   ★ 为什么需要它：上半屏用"行缓存"无法保存行位置（会滚动），
+//     下半屏用"行缓存"行数对不上（会花屏）。两者都必须进 DDR3 整帧缓存。
+//
+//   ★ 方案：写时钟固定为 pixclk_in(148.5MHz)，自己数 1080 行：
+//       行 0~539   : 跟随 hd_de，直接把 HDMI 像素写进去（780 us 一行自然跟随）
+//       行 540~1079: 自己产生 1920 拍/行，从摄像头行缓存取（cam1 960 + cam2 960）
+//     时间预算 8.3ms + 7.0ms = 15.3ms < 16.7ms（HDMI 帧周期）✅
+//
+//   ★ 摄像头行缓存：水平 3/4 抽稀（1280->960），双 bank，行就绪翻转跨域。
+//     读侧在 148.5MHz 下比摄像头产出快，同一行会重复几次 -> 纵向拉伸，
+//     但方向正确、无绕回、无花屏（良性妥协）。
+//=============================================================================
+module compose_wr #(
+    parameter integer H_LINE  = 1920,
+    parameter integer V_TOP   = 540,
+    parameter integer V_BOT   = 540,
+    parameter integer H_CELL  = 960
+)(
+    input  wire        clk,         // pixclk_in 148.5MHz
+    input  wire        rst_n,
+    input  wire        hd_de,
+    input  wire [15:0] hd_pix,
+    input  wire        hd_vs,
+    input  wire        c1_clk,
+    input  wire        c1_vs,         // 摄像头 VSYNC（用于帧对齐）
+    input  wire        c1_de,
+    input  wire [15:0] c1_pix,
+    input  wire        c2_clk,
+    input  wire        c2_de,
+    input  wire [15:0] c2_pix,
+    output reg         o_de,
+    output reg  [15:0] o_pix,
+    output reg         o_fsync,
+    output wire [15:0] dbg_srcw1,
+    output wire [15:0] dbg_srcw2,
+    output wire [15:0] dbg_botline,   // 本帧实际写满的摄像头行数
+    output wire [15:0] dbg_camlines   // 本帧摄像头到达的行数
+);
+
+    //--------------------------------------------------------------------------
+    // 摄像头行缓存：2 bank x 1024 x 16bit
+    //--------------------------------------------------------------------------
+    reg [15:0] lb1 [0:2047];
+    reg [15:0] lb2 [0:2047];
+
+    //---- cam1 采集 ----
+    reg [1:0]  c1_cnt;
+    reg [9:0]  c1_waddr;
+    reg        c1_de_d;
+    reg        c1_bank, c1_rdy_tgl;
+    reg [11:0] c1_pixcnt, c1_srcw;
+    // ★ 行结束滤波：de 持续低 64 拍才算一行结束，一行只产生一次（防 de 抖动导致多次切换 bank）
+    reg [6:0] c1_low_cnt2;
+    always @(posedge c1_clk or negedge rst_n) begin
+        if (!rst_n)                     c1_low_cnt2 <= 7'd0;
+        else if (c1_de)                 c1_low_cnt2 <= 7'd0;
+        else if (c1_low_cnt2 != 7'd127) c1_low_cnt2 <= c1_low_cnt2 + 7'd1;
+    end
+    wire c1_line_end = (c1_low_cnt2 == 7'd3);   // ★ 4 拍滤波（原来 64 拍，若 pclk 慢则永不触发）
+
+    always @(posedge c1_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            c1_de_d  <= 1'b0;
+            c1_cnt   <= 2'd0;
+            c1_waddr <= 10'd0;
+            c1_pixcnt<= 12'd0;
+            c1_srcw  <= 12'd0;
+        end else begin
+            c1_de_d <= c1_de;
+            if (!c1_de) begin
+                c1_cnt    <= 2'd0;
+                c1_waddr  <= 10'd0;
+                c1_pixcnt <= 12'd0;
+            end else begin
+                c1_cnt    <= c1_cnt + 2'd1;
+                c1_pixcnt <= c1_pixcnt + 12'd1;
+                if ((c1_cnt != 2'd3) && (c1_waddr < H_CELL-1))
+                    c1_waddr <= c1_waddr + 10'd1;
+            end
+            if (c1_line_end) c1_srcw <= c1_pixcnt;
+        end
+    end
+
+    wire c1_wr_en = c1_de & (c1_cnt != 2'd3) & (c1_waddr < H_CELL);
+
+    always @(posedge c1_clk) begin
+        if (c1_wr_en) lb1[{c1_bank, c1_waddr}] <= c1_pix;
+    end
+
+    always @(posedge c1_clk or negedge rst_n) begin
+        if (!rst_n) begin c1_bank <= 1'b0; c1_rdy_tgl <= 1'b0; end
+        else if (c1_line_end) begin
+            c1_bank    <= ~c1_bank;
+            c1_rdy_tgl <= ~c1_rdy_tgl;
+        end
+    end
+
+    //---- cam2 采集 ----
+    reg [1:0]  c2_cnt;
+    reg [9:0]  c2_waddr;
+    reg        c2_de_d;
+    reg        c2_bank, c2_rdy_tgl;
+    reg [11:0] c2_pixcnt, c2_srcw;
+    reg [6:0] c2_low_cnt2;
+    always @(posedge c2_clk or negedge rst_n) begin
+        if (!rst_n)                     c2_low_cnt2 <= 7'd0;
+        else if (c2_de)                 c2_low_cnt2 <= 7'd0;
+        else if (c2_low_cnt2 != 7'd127) c2_low_cnt2 <= c2_low_cnt2 + 7'd1;
+    end
+    wire c2_line_end = (c2_low_cnt2 == 7'd3);
+
+    always @(posedge c2_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            c2_de_d  <= 1'b0;
+            c2_cnt   <= 2'd0;
+            c2_waddr <= 10'd0;
+            c2_pixcnt<= 12'd0;
+            c2_srcw  <= 12'd0;
+        end else begin
+            c2_de_d <= c2_de;
+            if (!c2_de) begin
+                c2_cnt    <= 2'd0;
+                c2_waddr  <= 10'd0;
+                c2_pixcnt <= 12'd0;
+            end else begin
+                c2_cnt    <= c2_cnt + 2'd1;
+                c2_pixcnt <= c2_pixcnt + 12'd1;
+                if ((c2_cnt != 2'd3) && (c2_waddr < H_CELL-1))
+                    c2_waddr <= c2_waddr + 10'd1;
+            end
+            if (c2_line_end) c2_srcw <= c2_pixcnt;
+        end
+    end
+
+    wire c2_wr_en = c2_de & (c2_cnt != 2'd3) & (c2_waddr < H_CELL);
+
+    always @(posedge c2_clk) begin
+        if (c2_wr_en) lb2[{c2_bank, c2_waddr}] <= c2_pix;
+    end
+
+    always @(posedge c2_clk or negedge rst_n) begin
+        if (!rst_n) begin c2_bank <= 1'b0; c2_rdy_tgl <= 1'b0; end
+        else if (c2_line_end) begin
+            c2_bank    <= ~c2_bank;
+            c2_rdy_tgl <= ~c2_rdy_tgl;
+        end
+    end
+
+    //--------------------------------------------------------------------------
+    // 跨到写时钟域：bank 用电平同步（不会失步），行更新用翻转边沿
+    //--------------------------------------------------------------------------
+    reg [2:0] c1_rdy_s, c2_rdy_s;
+    reg [1:0] c1_bank_s, c2_bank_s;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            c1_rdy_s  <= 3'd0; c2_rdy_s  <= 3'd0;
+            c1_bank_s <= 2'd0; c2_bank_s <= 2'd0;
+        end else begin
+            c1_rdy_s  <= {c1_rdy_s[1:0],  c1_rdy_tgl};
+            c2_rdy_s  <= {c2_rdy_s[1:0],  c2_rdy_tgl};
+            c1_bank_s <= {c1_bank_s[0],   c1_bank};
+            c2_bank_s <= {c2_bank_s[0],   c2_bank};
+        end
+    end
+    wire c1_new = (c1_rdy_s[2:1] == 2'b01);
+    wire c2_new = (c2_rdy_s[2:1] == 2'b01);
+    wire rb1 = ~c1_bank_s[1];
+    wire rb2 = ~c2_bank_s[1];
+
+    //--------------------------------------------------------------------------
+    // HDMI 侧行计数（用于切 540 行）
+    //--------------------------------------------------------------------------
+    reg [11:0] hd_y;
+    reg        hd_de_d;
+    wire       hd_line_end = hd_de_d & ~hd_de;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            hd_y <= 12'd0; hd_de_d <= 1'b0;
+        end else begin
+            hd_de_d <= hd_de;
+            if (hd_vs)                 hd_y <= 12'd0;
+            else if (hd_line_end)      hd_y <= hd_y + 12'd1;
+        end
+    end
+
+    //--------------------------------------------------------------------------
+    // 行缓存读（寄存器输出，PDS 才能推断成 BRAM）
+    reg [15:0] px_rd;
+    wire [11:0] cidx = (bot_col < H_CELL) ? bot_col : (bot_col - H_CELL);
+    always @(posedge clk) begin
+        px_rd <= (st == S_BOTC2) ? lb2[{rb2h, bot_col[9:0]}]
+                                     : lb1[{rb1h, bot_col[9:0]}];
+    end
+
+    // 写器 FSM：S_TOP 跟随 HDMI 540 行；S_BOT 自己产 540 行摄像头
+    //--------------------------------------------------------------------------
+    localparam [2:0] S_WAIT = 3'd0, S_TOP = 3'd1, S_CWAIT = 3'd6,
+                   S_BOTW = 3'd2, S_BOTC1 = 3'd3, S_BOTC2 = 3'd4, S_BOTG = 3'd5;
+
+    // hd_vs 上升沿：每帧的起点
+    reg hd_vs_d2;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) hd_vs_d2 <= 1'b0;
+        else        hd_vs_d2 <= hd_vs;
+    end
+    wire hd_vs_rise = hd_vs & ~hd_vs_d2;
+
+    // 摄像头 VSYNC 同步（用于 S_BOT 帧对齐，消除滚动）
+    reg [2:0] c1vs_s;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) c1vs_s <= 3'd0;
+        else        c1vs_s <= {c1vs_s[1:0], c1_vs};
+    end
+    wire c1vs_rise = (c1vs_s[2:1] == 2'b01);
+
+    reg [2:0]  st;
+    reg [11:0] bot_line;    // S_BOT 已写满的行数
+    reg [11:0] bot_col;     // 行内列计数
+    reg [1:0]  c1_vcnt2;    // 垂直 3/4 抽行计数
+    reg        rb1h, rb2h;  // 本行读 bank（行开始时锁存）
+    reg [1:0]  hd_vs_div;   // hd_vs 四分频：一帧 = 4 个显示帧 = 66.7ms
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) hd_vs_div <= 2'd0;
+        else if (hd_vs_rise) hd_vs_div <= hd_vs_div + 2'd1;
+    end
+    // ★ 每 2 个 hd_vs 一次 = 33.3ms = 严格 30fps
+    //   必须与显示侧 60Hz 保持 2:1 整数比，否则双缓冲切换不同步 -> 撕裂/多段/抽搐
+    wire frame_start = hd_vs_rise & (hd_vs_div == 2'd3);   // 每 4 个 hd_vs = 66.7ms，写侧有余量
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            st       <= S_WAIT;
+            bot_line <= 12'd0;
+            bot_col  <= 12'd0;
+            o_de     <= 1'b0;
+            o_pix    <= 16'd0;
+            o_fsync  <= 1'b0;
+        end else begin
+            case (st)
+                //=========== 等帧起点（每 2 个 hd_vs = 33.3ms）===========
+                S_WAIT: begin
+                    o_de <= 1'b0;
+                    if (frame_start) begin
+                        o_fsync  <= 1'b1;      // ★ 帧同步只在这里发
+                        bot_line <= 12'd0;
+                        bot_col  <= 12'd0;
+                        c1_vcnt2 <= 2'd0;
+                        st       <= S_TOP;
+                    end else begin
+                        o_fsync  <= 1'b0;
+                    end
+                end
+                //=========== 上半屏：完全跟随 HDMI（不变）===========
+                S_TOP: begin
+                    o_de    <= hd_de;
+                    o_pix   <= hd_pix;
+                    o_fsync <= 1'b0;
+                    if (hd_line_end && (hd_y >= V_TOP-1)) begin
+                        st       <= S_CWAIT;   // 等摄像头帧起点（消除滚动）
+                        bot_line <= 12'd0;
+                    end
+                end
+                //=========== 等摄像头 VSYNC（帧对齐，消除滚动）===========
+                S_CWAIT: begin
+                    o_de <= 1'b0;
+                    if (c1vs_rise) begin
+                        bot_line <= 12'd0;
+                        bot_col  <= 12'd0;
+                        st       <= S_BOTW;
+                    end
+                end
+                //=========== 下半屏：等摄像头的行（3/4 抽行）===========
+                S_BOTW: begin
+                    o_de <= 1'b0;
+                    if (c1_new) begin
+                        // ★ 不做垂直抽行（对齐 1944 验证版：1:1 取摄像头前 540 行）
+                        rb1h    <= rb1;     // 锁存本行要读的 bank
+                        rb2h    <= rb2;
+                        bot_col <= 12'd0;
+                        st      <= S_BOTC1;
+                    end
+                end
+                S_BOTC1: begin
+                    o_de  <= 1'b1;
+                    o_pix <= px_rd;
+                    if (bot_col == H_CELL-1) begin
+                        bot_col <= 12'd0;
+                        st      <= S_BOTC2;
+                    end else begin
+                        bot_col <= bot_col + 12'd1;
+                    end
+                end
+                //=========== 输出 960 拍 cam2 ===========
+                S_BOTC2: begin
+                    o_de  <= 1'b1;
+                    o_pix <= px_rd;
+                    if (bot_col == H_CELL-1) begin
+                        o_de    <= 1'b0;
+                        bot_line<= bot_line + 12'd1;
+                        st      <= S_BOTG;
+                    end else begin
+                        bot_col <= bot_col + 12'd1;
+                    end
+                end
+                //=========== 行间 1 拍低 + 判断写满 540 行 ===========
+                S_BOTG: begin
+                    o_de <= 1'b0;
+                    if (bot_line >= V_BOT) begin
+                        st <= S_WAIT;       // 下半屏 540 行写满
+                    end else begin
+                        st <= S_BOTW;
+                    end
+                end
+                default: st <= S_WAIT;
+            endcase
+        end
+    end
+
+    //---- 诊断：摄像头每帧到达行数（frame_start 清零）+ 本帧写满行数 ----
+    reg [11:0] camline_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)              camline_cnt <= 12'd0;
+        else if (frame_start)    camline_cnt <= 12'd0;
+        else if (c1_new)         camline_cnt <= camline_cnt + 12'd1;
+    end
+    // ★ 诊断改为"帧末锁存"，UART 采样才有意义
+    reg [11:0] lat_botline = 0, lat_camlines = 0;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin lat_botline <= 12'd0; lat_camlines <= 12'd0; end
+        else if (frame_start) begin
+            lat_botline  <= bot_line;
+            lat_camlines <= camline_cnt;
+        end
+    end
+    assign dbg_botline  = {4'd0, lat_botline};
+    assign dbg_camlines = {4'd0, lat_camlines};
+
+    assign dbg_srcw1 = {4'd0, c1_srcw};
+    assign dbg_srcw2 = {4'd0, c2_srcw};
+
+endmodule
+
+//=============================================================================
+// module cam_lb1  --  摄像头行缓存（版本二 2026-10-30 新增）
+//
+//   用途：把 cam1 的一行 RGB565 抽稀成 960 像素，供 HDMI 写侧在
+//         【pixclk_in 域】按 rd_x 直接索引 —— 版本二右半屏（x=960..1919）
+//         取的就是它。
+//
+//   写侧（c_clk = cam_pclk_16bit 域）：
+//     · 水平 3/4 抽稀：每 4 个源像素丢第 4 个 -> 1280 -> 960
+//     · 双 bank 乒乓：写当前 bank，读"上一个写满的 bank"
+//     · 行结束用【4 拍低电平滤波】判定。
+//       ⚠️ 绝不能改成 64 拍：pclk 慢时 64 拍会超过行消隐长度，
+//          行结束永不触发 -> bank 不切换 -> 画面挤压成一条。
+//
+//   读侧（clk = pixclk_in 域）：
+//     · bank 打两拍后取反 = 刚写满的那个 bank（电平同步，不会失步）
+//       写侧在【行消隐期间】才翻 bank，所以读侧晚两拍看到也不会读到半行。
+//     · 输出必须寄存器化（rd_pix <= mem[..]），组合读大数组 PDS 推断不出
+//       BRAM，会退化成分布式 RAM。
+//
+//   容量：2 x 1024 x 16bit = 2 个 DRM。H_CELL 必须 <= 1024（bank 是 2 的幂）。
+//
+//   行为：摄像头没出图（c_de 恒低）时 bank 不翻，读侧一直读 bank1，
+//         而 bank1 被 initial 清成 0 -> 右半屏是黑的，不会花屏。
+//=============================================================================
+`timescale 1ns / 1ps
+
+module cam_lb1 #(
+    parameter integer H_CELL = 960          // 输出宽度 = 1280 * 3/4
+)(
+    input  wire        clk,                 // pixclk_in，读时钟
+    input  wire        rst_n,
+    input  wire        c_clk,               // cam_pclk_16bit，写时钟
+    input  wire        c_de,                // 摄像头行有效
+    input  wire [15:0] c_pix,               // 摄像头 RGB565
+    input  wire [11:0] rd_x,                // 0..959
+    output reg  [15:0] rd_pix,
+    output wire        o_line_new           // 新的一行写满了（clk 域 1 拍脉冲）
+);
+
+    reg [15:0] lb [0:2047];                 // 2 bank x 1024
+    integer i;
+    initial begin
+        for (i = 0; i < 1024; i = i + 1) begin
+            lb[i]        = 16'd0;
+            lb[1024 + i] = 16'd0;
+        end
+    end
+    // ⚠️ PDS 的 initial 循环上限是 2000 次，这里 1024 次，安全。
+    //    若换工具报 Loop limit，直接删掉这个 initial 就行
+    //    （Pango 的 DRM 上电内容本来就是全 0）。
+
+    //-------------------------------------------------------------------------
+    // 一、写侧：水平 3/4 抽稀（1280 -> 960）
+    //     每 4 拍为一组：第 0/1/2 拍写，第 3 拍跳过
+    //-------------------------------------------------------------------------
+    reg [1:0]  cnt;
+    reg [9:0]  waddr;
+    reg        bank, rdy_tgl;
+    reg [6:0]  low_cnt;
+
+    // 行结束 = de 持续低 4 拍，只产生 1 个 c_clk 周期的脉冲
+    wire line_end = (low_cnt == 7'd3);
+
+    always @(posedge c_clk or negedge rst_n) begin
+        if (!rst_n)                 low_cnt <= 7'd0;
+        else if (c_de)              low_cnt <= 7'd0;
+        else if (low_cnt != 7'd127) low_cnt <= low_cnt + 7'd1;
+    end
+
+    always @(posedge c_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            cnt     <= 2'd0;
+            waddr   <= 10'd0;
+            bank    <= 1'b0;
+            rdy_tgl <= 1'b0;
+        end else begin
+            if (!c_de) begin
+                cnt   <= 2'd0;
+                waddr <= 10'd0;
+            end else begin
+                cnt <= cnt + 2'd1;
+                if ((cnt != 2'd3) && (waddr < H_CELL-1))
+                    waddr <= waddr + 10'd1;
+            end
+            if (line_end) begin
+                bank    <= ~bank;
+                rdy_tgl <= ~rdy_tgl;
+            end
+        end
+    end
+
+    wire wr_en = c_de & (cnt != 2'd3);
+    always @(posedge c_clk) begin
+        if (wr_en) lb[{bank, waddr}] <= c_pix;
+    end
+
+    //-------------------------------------------------------------------------
+    // 二、跨到读时钟域
+    //     bank 打两拍后取反 = 上一个写满的 bank
+    //     （rdy_tgl / rdy_s 与规格一致保留：目前不参与选择，留给波形观察）
+    //-------------------------------------------------------------------------
+    reg [2:0] rdy_s;
+    reg [1:0] bank_s;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rdy_s  <= 3'd0;
+            bank_s <= 2'd0;
+        end else begin
+            rdy_s  <= {rdy_s[1:0], rdy_tgl};
+            bank_s <= {bank_s[0],  bank};
+        end
+    end
+    wire rb = ~bank_s[1];
+
+    //-------------------------------------------------------------------------
+    // 三、读侧（必须寄存器读）
+    //-------------------------------------------------------------------------
+    always @(posedge clk) begin
+        rd_pix <= lb[{rb, rd_x[9:0]}];
+    end
+
+    // 新行就绪脉冲：rdy_tgl 打两拍后取上升沿（与 bank 同步一致，不会误触发）
+    assign o_line_new = (rdy_s[2:1] == 2'b01);
+
+endmodule
+
+//=============================================================================
+// module fram_buf_dual  --  双路 DDR3 帧缓存（版本二 2026-10-30 新增）
+//
+//   为什么需要它：
+//     版本二左半是 HDMI（60fps），右半是摄像头（720P@30）。一个写口装不下两个
+//     帧率不同的源：摄像头一个显示帧只给半帧，右半只能是"半帧扫描带"，摄像机
+//     帧回绕的接缝就落在画面中间并随两个时钟相位的漂移慢慢滚动 —— 这就是上板
+//     看到的裂屏/条纹。1944 版能干净，是因为整屏都来自摄像头、写侧跑在摄像头
+//     时钟域（一个写帧 = 一个摄像头帧）。
+//
+//   做法：DDR3 里放两块互不相干的帧缓存
+//     · 显示帧  ：1920x1080 @60fps（就是版本一那一路，接法一字未改）
+//     · 摄像头帧：960x1080 @30fps（摄像机 960x720 竖直 1.5 倍拉伸）
+//   两个 wr_buf / 两个 rd_buf 共用一个 wr_rd_ctrl_top（= 同一个 DDR3 AXI 口），
+//   在本模块里做命令级 + 数据级仲裁：写方向同时只有一个 master，读方向同理。
+//
+//   摄像头读侧的"帧选择"：
+//     60fps 的显示每 16.7ms 读一帧，而摄像头 33ms 才写一帧。如果让 rd_buf 按
+//     rd_fsync 自己翻 bank，就会两帧一轮地读到"正在写的那块"。所以这里把
+//     rd_buf 的帧选择改成外部输入 ext_frame_sel：只有一帧【写完整】之后，
+//     在下一个 rd_fsync 才切换 —— 每个摄像头帧被稳定显示两遍，不闪不撕。
+//
+//   地址分配（DDR3 32 位字地址）：
+//     0x0000_0000 起 2^23 字（32MB）给显示帧（wr_buf/rd_buf 内部用 {帧位,行}）
+//     0x0080_0000 起 2^22 字（16MB）给摄像头帧（行地址 21 位，两块 bank）
+//=============================================================================
+module fram_buf_dual #(
+    parameter MEM_ROW_WIDTH    = 15,
+    parameter MEM_COLUMN_WIDTH = 10,
+    parameter MEM_BANK_WIDTH   = 3,
+    parameter CTRL_ADDR_WIDTH  = MEM_ROW_WIDTH + MEM_BANK_WIDTH + MEM_COLUMN_WIDTH,
+    parameter MEM_DQ_WIDTH     = 32,
+    parameter H_NUM            = 12'd1920,
+    parameter V_NUM            = 12'd1080,
+    parameter PIX_WIDTH        = 16,
+    parameter CAM_H_NUM        = 12'd640,
+    parameter CAM_V_NUM        = 12'd480,
+    parameter [CTRL_ADDR_WIDTH-1:0] CAM_ADDR_OFFSET = 28'h080_0000
+)(
+    //---------------- 显示流（与 fram_buf 完全一致的接口）----------------
+    input  wire                       vin_clk,
+    input  wire                       wr_fsync,
+    input  wire                       wr_en,
+    input  wire [PIX_WIDTH-1'b1:0]    wr_data,
+    output wire                       init_done,
+    input  wire                       ddr_clk,
+    input  wire                       ddr_rstn,
+    input  wire                       vout_clk,
+    input  wire                       rd_fsync,
+    input  wire                       rd_en,
+    output wire                       vout_de,
+    output wire [PIX_WIDTH-1'b1:0]    vout_data,
+    //---------------- 摄像头流 ----------------
+    input  wire                       cam_vin_clk,
+    input  wire                       cam_fsync,
+    input  wire                       cam_en,
+    input  wire [PIX_WIDTH-1'b1:0]    cam_data,
+    // 摄像头读窗口（2026-10-30 晚：改成由 cam_line_rd 自己判定，见 u_rd_cam）
+    input  wire                       cam_rd_de,
+    input  wire [11:0]                cam_rd_x,
+    output wire                       cam_vout_de,
+    output wire [PIX_WIDTH-1'b1:0]    cam_vout_data,
+    //---------------- AXI ----------------
+    output wire [CTRL_ADDR_WIDTH-1:0] axi_awaddr,
+    output wire [3:0]                 axi_awid,
+    output wire [3:0]                 axi_awlen,
+    output wire [2:0]                 axi_awsize,
+    output wire [1:0]                 axi_awburst,
+    input  wire                       axi_awready,
+    output wire                       axi_awvalid,
+    output wire [MEM_DQ_WIDTH*8-1:0]  axi_wdata,
+    output wire [MEM_DQ_WIDTH-1:0]    axi_wstrb,
+    input  wire                       axi_wlast,
+    output wire                       axi_wvalid,
+    input  wire                       axi_wready,
+    input  wire [3:0]                 axi_bid,
+    output wire [CTRL_ADDR_WIDTH-1:0] axi_araddr,
+    output wire [3:0]                 axi_arid,
+    output wire [3:0]                 axi_arlen,
+    output wire [2:0]                 axi_arsize,
+    output wire [1:0]                 axi_arburst,
+    output wire                       axi_arvalid,
+    input  wire                       axi_arready,
+    output wire                       axi_rready,
+    input  wire [MEM_DQ_WIDTH*8-1:0]  axi_rdata,
+    input  wire                       axi_rvalid,
+    input  wire                       axi_rlast,
+    input  wire [3:0]                 axi_rid
+);
+
+    localparam LEN_WIDTH        = 32;
+    localparam LINE_ADDR_WIDTH  = 22;                              // 显示帧行地址位宽
+    localparam CAM_LINE_ADDR_W  = 21;                              // 摄像头帧行地址位宽
+    localparam FRAME_CNT_WIDTH  = CTRL_ADDR_WIDTH - LINE_ADDR_WIDTH;
+
+    //=========================================================================
+    // 0. 摄像头"最近一个写完整的帧"所在的 bank（读侧帧选择）
+    //    必须在 rd_buf 例化之前声明（规格 §4 坑 9：不能靠隐式线网）
+    //=========================================================================
+    reg         cam_rd_bank;
+
+    //=========================================================================
+    // 一、四块缓存实例（两写两读）
+    //=========================================================================
+    //---------------- 显示：写 ----------------
+    wire                        dis_wreq;
+    wire [CTRL_ADDR_WIDTH-1:0]  dis_waddr;
+    wire [LEN_WIDTH-1:0]        dis_wlen;
+    wire                        dis_wrdy, dis_wdone, dis_wdata_req, dis_wbac;
+    wire [8*MEM_DQ_WIDTH-1:0]   dis_wdata;
+    wire [FRAME_CNT_WIDTH-1:0]  dis_wframe;
+    wire                        dis_wirq;
+
+    wr_buf #(
+        .ADDR_WIDTH       (CTRL_ADDR_WIDTH  ),
+        .ADDR_OFFSET      (32'd0            ),
+        .H_NUM            (H_NUM            ),
+        .V_NUM            (V_NUM            ),
+        .DQ_WIDTH         (MEM_DQ_WIDTH     ),
+        .LEN_WIDTH        (LEN_WIDTH        ),
+        .PIX_WIDTH        (PIX_WIDTH        ),
+        .LINE_ADDR_WIDTH  (LINE_ADDR_WIDTH  ),
+        .FRAME_CNT_WIDTH  (FRAME_CNT_WIDTH  )
+    ) u_wr_dis (
+        .ddr_clk       (ddr_clk        ),
+        .ddr_rstn      (ddr_rstn       ),
+        .wr_clk        (vin_clk        ),
+        .wr_fsync      (wr_fsync       ),
+        .wr_en         (wr_en          ),
+        .wr_data       (wr_data        ),
+        .rd_bac        (dis_wbac       ),
+        .ddr_wreq      (dis_wreq       ),
+        .ddr_waddr     (dis_waddr      ),
+        .ddr_wr_len    (dis_wlen       ),
+        .ddr_wrdy      (dis_wrdy       ),
+        .ddr_wdone     (dis_wdone      ),
+        .ddr_wdata     (dis_wdata      ),
+        .ddr_wdata_req (dis_wdata_req  ),
+        .frame_wcnt    (dis_wframe     ),
+        .frame_wirq    (dis_wirq       )
+    );
+
+    //---------------- 摄像头：写 ----------------
+    wire                        cam_wreq;
+    wire [CTRL_ADDR_WIDTH-1:0]  cam_waddr;
+    wire [LEN_WIDTH-1:0]        cam_wlen;
+    wire                        cam_wrdy, cam_wdone, cam_wdata_req, cam_wbac;
+    wire [8*MEM_DQ_WIDTH-1:0]   cam_wdata;
+    wire [FRAME_CNT_WIDTH-1:0]  cam_wframe;
+
+    wr_buf #(
+        .ADDR_WIDTH       (CTRL_ADDR_WIDTH   ),
+        .ADDR_OFFSET      (CAM_ADDR_OFFSET   ),
+        .H_NUM            (CAM_H_NUM         ),
+        .V_NUM            (CAM_V_NUM         ),
+        .DQ_WIDTH         (MEM_DQ_WIDTH      ),
+        .LEN_WIDTH        (LEN_WIDTH         ),
+        .PIX_WIDTH        (PIX_WIDTH         ),
+        .LINE_ADDR_WIDTH  (CAM_LINE_ADDR_W   ),
+        .FRAME_CNT_WIDTH  (FRAME_CNT_WIDTH   )
+    ) u_wr_cam (
+        .ddr_clk       (ddr_clk        ),
+        .ddr_rstn      (ddr_rstn       ),
+        .wr_clk        (cam_vin_clk    ),
+        .wr_fsync      (cam_fsync      ),
+        .wr_en         (cam_en         ),
+        .wr_data       (cam_data       ),
+        .rd_bac        (cam_wbac       ),
+        .ddr_wreq      (cam_wreq       ),
+        .ddr_waddr     (cam_waddr      ),
+        .ddr_wr_len    (cam_wlen       ),
+        .ddr_wrdy      (cam_wrdy       ),
+        .ddr_wdone     (cam_wdone      ),
+        .ddr_wdata     (cam_wdata      ),
+        .ddr_wdata_req (cam_wdata_req  ),
+        .frame_wcnt    (cam_wframe     ),
+        .frame_wirq    (               )
+    );
+
+    //---------------- 显示：读 ----------------
+    wire                        dis_rreq;
+    wire [CTRL_ADDR_WIDTH-1:0]  dis_raddr;
+    wire [LEN_WIDTH-1:0]        dis_rlen;
+    wire                        dis_rrdy, dis_rdone;
+    wire [8*MEM_DQ_WIDTH-1:0]   dis_rdata;
+    wire                        dis_rden;
+
+    rd_buf #(
+        .ADDR_WIDTH       (CTRL_ADDR_WIDTH  ),
+        .ADDR_OFFSET      (32'd0            ),
+        .H_NUM            (H_NUM            ),
+        .V_NUM            (V_NUM            ),
+        .DQ_WIDTH         (MEM_DQ_WIDTH     ),
+        .LEN_WIDTH        (LEN_WIDTH        ),
+        .PIX_WIDTH        (PIX_WIDTH        ),
+        .LINE_ADDR_WIDTH  (LINE_ADDR_WIDTH  ),
+        .FRAME_CNT_WIDTH  (FRAME_CNT_WIDTH  ),
+        .EXT_FRAME_SEL    (1'b0             )
+    ) u_rd_dis (
+        .ddr_clk       (ddr_clk        ),
+        .ddr_rstn      (ddr_rstn       ),
+        .ext_frame_sel (1'b0           ),
+        .vout_clk      (vout_clk       ),
+        .rd_fsync      (rd_fsync       ),
+        .rd_en         (rd_en          ),
+        .vout_de       (vout_de        ),
+        .vout_data     (vout_data      ),
+        .init_done     (init_done      ),
+        .ddr_rreq      (dis_rreq       ),
+        .ddr_raddr     (dis_raddr      ),
+        .ddr_rd_len    (dis_rlen       ),
+        .ddr_rrdy      (dis_rrdy       ),
+        .ddr_rdone     (dis_rdone      ),
+        .ddr_rdata     (dis_rdata      ),
+        .ddr_rdata_en  (dis_rden       )
+    );
+
+    //---------------- 摄像头：读（自写行指针 + 双轴 Bresenham，不是厂商 rd_buf） ----
+    //   ★ 2026-10-30 晚：这里原来是 rd_buf。厂商 rd_buf 的行号只会 +1，
+    //     没法让"同一源行显示两遍"，所以它做不了纵向放大（480 -> 1080）——
+    //     这正是"纵向拉伸必须放在读侧"时撞上的墙。
+    //     现在换成 cam_line_rd：自己维护源行指针（纵向 Bresenham）+ 源列指针
+    //     （水平 Bresenham），每显示行只在源行号前进时才读一次 DDR。
+    wire                        cam_rreq;
+    wire [CTRL_ADDR_WIDTH-1:0]  cam_raddr;
+    wire [LEN_WIDTH-1:0]        cam_rlen;
+    wire                        cam_rrdy, cam_rdone;
+    wire [8*MEM_DQ_WIDTH-1:0]   cam_rdata;
+    wire                        cam_rden;
+
+    cam_line_rd #(
+        .SRC_W            (CAM_H_NUM      ),   // 源行宽 = 摄像头真实行宽
+        .SRC_H            (CAM_V_NUM      ),   // 源行数 = 每帧真实行数
+        .DST_X0           (H_NUM/2        ),   // 右半屏起点 = 960
+        .DST_W            (H_NUM/2        ),   // 右半屏宽   = 960
+        .DST_H            (V_NUM          )    // 屏幕高     = 1080
+    ) u_rd_cam (
+        .vout_clk     (vout_clk        ),
+        .ddr_clk      (ddr_clk         ),
+        .rst_n        (ddr_rstn        ),
+        .rd_fsync     (rd_fsync        ),
+        .rd_de        (cam_rd_de       ),
+        .rd_x         (cam_rd_x        ),
+        .frame_bank   (cam_rd_bank     ),
+        .base_addr    (CAM_ADDR_OFFSET ),
+        .ddr_rreq     (cam_rreq        ),
+        .ddr_raddr    (cam_raddr       ),
+        .ddr_rd_len   (cam_rlen        ),
+        .ddr_rdone    (cam_rdone       ),
+        .ddr_rdata_en (cam_rden        ),
+        .ddr_rdata    (cam_rdata       ),
+        .vout_data    (cam_vout_data   ),
+        .vout_de      (cam_vout_de     )
+    );
+
+    //=========================================================================
+    // 二、摄像头帧"写完整"检测 + 读侧帧选择
+    //     cam 每写完一整帧 CAM_V_NUM 行 -> cam_done_tgl 翻转，并把那一块的 bank
+    //     存下来；读侧在下一个 rd_fsync 才把 ext_frame_sel 切过去。
+    //=========================================================================
+    reg  [11:0] cam_line_cnt;
+    reg  [2:0]  camfs_s;
+    reg         cam_mybank;
+    reg         cam_done_tgl;
+    reg         cam_done_bank;
+    wire        cam_fsync_rise = (camfs_s[2:1] == 2'b01);
+
+    // cam_mybank 是 wr_buf 内部帧计数（从 0 开始、每帧翻转）的镜像，
+    // 用摄像机 VSYNC 同步翻转；两者同源同初值，所以永远对得上。
+    // 用 VSYNC 判断"上一帧写完了"比数 1080 行更稳：摄像机少给/多给一行也不会失步。
+    always @(posedge ddr_clk or negedge ddr_rstn) begin
+        if (!ddr_rstn) begin
+            cam_line_cnt  <= 12'd0;
+            camfs_s       <= 3'd0;
+            cam_mybank    <= 1'b0;
+            cam_done_tgl  <= 1'b0;
+            cam_done_bank <= 1'b0;
+        end else begin
+            camfs_s <= {camfs_s[1:0], cam_fsync};
+            if (cam_fsync_rise && (cam_line_cnt != 12'd0)) begin
+                cam_done_bank <= cam_mybank;     // 刚写完的是这一块
+                cam_mybank    <= ~cam_mybank;
+                cam_done_tgl  <= ~cam_done_tgl;
+                cam_line_cnt  <= 12'd0;
+            end else if (cam_wdone) begin
+                cam_line_cnt <= cam_line_cnt + 12'd1;
+            end
+        end
+    end
+
+    reg [1:0] cam_done_s;
+    reg       cam_bank_s;
+    reg       cam_seen;
+
+    always @(posedge vout_clk or negedge ddr_rstn) begin
+        if (!ddr_rstn) begin
+            cam_done_s <= 2'd0;
+            cam_bank_s <= 1'b0;
+        end else begin
+            cam_done_s <= {cam_done_s[0], cam_done_tgl};
+            cam_bank_s <= cam_done_bank;
+        end
+    end
+
+    always @(posedge vout_clk or negedge ddr_rstn) begin
+        if (!ddr_rstn) begin
+            cam_seen    <= 1'b0;
+            cam_rd_bank <= 1'b0;
+        end else if (rd_fsync && (cam_done_s[1] != cam_seen)) begin
+            cam_seen    <= cam_done_s[1];
+            cam_rd_bank <= cam_bank_s;
+        end
+    end
+
+    //=========================================================================
+    // 三、DDR3 口仲裁（命令级 + 数据级）
+    //=========================================================================
+    wire                       wr_cmd_en, wr_cmd_ready, wr_cmd_done, wr_data_re, wr_bac;
+    wire [CTRL_ADDR_WIDTH-1:0] wr_cmd_addr;
+    wire [31:0]                wr_cmd_len;
+    wire [8*MEM_DQ_WIDTH-1:0]  wr_ctrl_data;
+
+    wire                       rd_cmd_en, rd_cmd_ready, rd_cmd_done, rd_rdata_en;
+    wire [CTRL_ADDR_WIDTH-1:0] rd_cmd_addr;
+    wire [31:0]                rd_cmd_len;
+    wire [8*MEM_DQ_WIDTH-1:0]  rd_rdata;
+
+    //---------------- 写方向 ----------------
+    reg  wr_busy, wr_sel, wr_go;
+    reg  [15:0] wr_wdog;
+
+    wire dis_own = (wr_busy && !wr_sel);
+    wire cam_own = (wr_busy &&  wr_sel);
+    wire wr_done_now = cam_own ? cam_wdone : dis_wdone;
+
+    always @(posedge ddr_clk or negedge ddr_rstn) begin
+        if (!ddr_rstn) begin
+            wr_busy <= 1'b0;
+            wr_sel  <= 1'b0;
+            wr_go   <= 1'b0;
+            wr_wdog <= 16'd0;
+        end else begin
+            wr_go <= 1'b0;
+            if (!wr_busy) begin
+                wr_wdog <= 16'd0;
+                if (dis_wreq)      begin wr_busy <= 1'b1; wr_sel <= 1'b0; wr_go <= 1'b1; end
+                else if (cam_wreq) begin wr_busy <= 1'b1; wr_sel <= 1'b1; wr_go <= 1'b1; end
+            end else begin
+                wr_wdog <= wr_wdog + 16'd1;
+                // 正常结束 / 看门狗兜底（防止某一路卡死把整个 DDR3 口拖住）
+                if (wr_done_now || (wr_wdog == 16'hFFFF))
+                    wr_busy <= 1'b0;
+            end
+        end
+    end
+
+    assign wr_cmd_en    = wr_go;
+    assign wr_cmd_addr  = wr_sel ? cam_waddr : dis_waddr;
+    assign wr_cmd_len   = wr_sel ? cam_wlen  : dis_wlen;
+    assign wr_ctrl_data = wr_sel ? cam_wdata : dis_wdata;
+
+    assign dis_wrdy      = dis_own ? wr_cmd_ready : 1'b0;
+    assign dis_wdone     = dis_own ? wr_cmd_done  : 1'b0;
+    assign dis_wdata_req = dis_own ? wr_data_re   : 1'b0;
+    assign dis_wbac      = dis_own ? wr_bac       : 1'b0;
+
+    // ⚠️ 2026-10-30 修：这里原来漏了这一行，cam_wdone 变成隐式线网恒 0，
+    //    摄像头写事务永远不结束 -> 看门狗中途放掉 -> 共享的 wr_cmd_trans 卡死
+    //    -> 显示帧也写不进去（左半定格）、摄像头帧从来没写完整（右半花屏）。
+    assign cam_wdone     = cam_own ? wr_cmd_done  : 1'b0;
+    assign cam_wrdy      = cam_own ? wr_cmd_ready : 1'b0;
+    assign cam_wdata_req = cam_own ? wr_data_re   : 1'b0;
+    assign cam_wbac      = cam_own ? wr_bac       : 1'b0;
+
+    //---------------- 读方向 ----------------
+    reg  rd_busy, rd_sel, rd_go;
+    reg  dis_rpend, cam_rpend;
+    reg  [15:0] rd_beat;
+    reg  [15:0] rd_wdog;
+
+    wire dis_ask = dis_rreq | dis_rpend;
+    wire cam_ask = cam_rreq | cam_rpend;
+    wire gnt_dis = (!rd_busy) && dis_ask;
+    wire gnt_cam = (!rd_busy) && (!dis_ask) && cam_ask;
+
+    wire dis_ro = (rd_busy && !rd_sel);
+    wire cam_ro = (rd_busy &&  rd_sel);
+    wire rd_done_now = cam_ro ? cam_rdone : dis_rdone;
+    wire [15:0] rd_len_now = rd_sel ? cam_rlen[15:0] : dis_rlen[15:0];
+    wire rd_data_done = (rd_beat >= rd_len_now);
+
+    always @(posedge ddr_clk or negedge ddr_rstn) begin
+        if (!ddr_rstn) begin
+            rd_busy   <= 1'b0;
+            rd_sel    <= 1'b0;
+            rd_go     <= 1'b0;
+            dis_rpend <= 1'b0;
+            cam_rpend <= 1'b0;
+            rd_beat   <= 16'd0;
+            rd_wdog   <= 16'd0;
+        end else begin
+            rd_go <= 1'b0;
+
+            // 数据计数：只数 owner 那一路的返回数据
+            if (!rd_busy)         rd_beat <= 16'd0;
+            else if (rd_rdata_en) rd_beat <= rd_beat + 16'd1;
+
+            if (!rd_busy) begin
+                rd_wdog <= 16'd0;
+                if (dis_ask)      begin rd_busy <= 1'b1; rd_sel <= 1'b0; rd_go <= 1'b1; end
+                else if (cam_ask) begin rd_busy <= 1'b1; rd_sel <= 1'b1; rd_go <= 1'b1; end
+            end else begin
+                rd_wdog <= rd_wdog + 16'd1;
+                if ((rd_done_now && rd_data_done) || (rd_wdog == 16'hFFFF))
+                    rd_busy <= 1'b0;
+            end
+
+            // 没被立刻服务的请求挂起，等下一次（丢了会让那一路永久错行）
+            dis_rpend <= dis_ask & ~gnt_dis;
+            cam_rpend <= cam_ask & ~gnt_cam;
+        end
+    end
+
+    assign rd_cmd_en   = rd_go;
+    assign rd_cmd_addr = rd_sel ? cam_raddr : dis_raddr;
+    assign rd_cmd_len  = rd_sel ? cam_rlen  : dis_rlen;
+
+    assign dis_rrdy  = dis_ro ? rd_cmd_ready : 1'b0;
+    assign dis_rdone = dis_ro ? rd_cmd_done  : 1'b0;
+    assign dis_rden  = dis_ro ? rd_rdata_en  : 1'b0;
+    assign cam_rrdy  = cam_ro ? rd_cmd_ready : 1'b0;
+    assign cam_rdone = cam_ro ? rd_cmd_done  : 1'b0;
+    assign cam_rden  = cam_ro ? rd_rdata_en  : 1'b0;
+
+    assign dis_rdata = rd_rdata;      // 总线共享，只有 owner 的 rdata_en 有效
+    assign cam_rdata = rd_rdata;
+
+    //=========================================================================
+    // 四、DDR3 控制器（读写各一路，接法与原 fram_buf 一致）
+    //=========================================================================
+    wr_rd_ctrl_top #(
+        .CTRL_ADDR_WIDTH (CTRL_ADDR_WIDTH),
+        .MEM_DQ_WIDTH    (MEM_DQ_WIDTH   )
+    ) u_wr_rd_ctrl (
+        .clk           (ddr_clk        ),
+        .rstn          (ddr_rstn       ),
+        .wr_cmd_en     (wr_cmd_en      ),
+        .wr_cmd_addr   (wr_cmd_addr    ),
+        .wr_cmd_len    (wr_cmd_len     ),
+        .wr_cmd_ready  (wr_cmd_ready   ),
+        .wr_cmd_done   (wr_cmd_done    ),
+        .wr_bac        (wr_bac         ),
+        .wr_ctrl_data  (wr_ctrl_data   ),
+        .wr_data_re    (wr_data_re     ),
+        .rd_cmd_en     (rd_cmd_en      ),
+        .rd_cmd_addr   (rd_cmd_addr    ),
+        .rd_cmd_len    (rd_cmd_len     ),
+        .rd_cmd_ready  (rd_cmd_ready   ),
+        .rd_cmd_done   (rd_cmd_done    ),
+        .read_ready    (1'b1           ),
+        .read_rdata    (rd_rdata       ),
+        .read_en       (rd_rdata_en    ),
+        .axi_awaddr    (axi_awaddr     ),
+        .axi_awid      (axi_awid       ),
+        .axi_awlen     (axi_awlen      ),
+        .axi_awsize    (axi_awsize     ),
+        .axi_awburst   (axi_awburst    ),
+        .axi_awready   (axi_awready    ),
+        .axi_awvalid   (axi_awvalid    ),
+        .axi_wdata     (axi_wdata      ),
+        .axi_wstrb     (axi_wstrb      ),
+        .axi_wlast     (axi_wlast      ),
+        .axi_wvalid    (axi_wvalid     ),
+        .axi_wready    (axi_wready     ),
+        .axi_bid       (axi_bid        ),
+        .axi_bresp     (2'd0           ),
+        .axi_bvalid    (1'b0           ),
+        .axi_bready    (               ),
+        .axi_araddr    (axi_araddr     ),
+        .axi_arid      (axi_arid       ),
+        .axi_arlen     (axi_arlen      ),
+        .axi_arsize    (axi_arsize     ),
+        .axi_arburst   (axi_arburst    ),
+        .axi_arvalid   (axi_arvalid    ),
+        .axi_arready   (axi_arready    ),
+        .axi_rready    (axi_rready     ),
+        .axi_rdata     (axi_rdata      ),
+        .axi_rvalid    (axi_rvalid     ),
+        .axi_rlast     (axi_rlast      ),
+        .axi_rid       (axi_rid        ),
+        .axi_rresp     (2'd0           )
+    );
+
+    //=========================================================================
+    // 五、初始化完成（沿用原逻辑：显示流写过一整帧才算就绪）
+    //=========================================================================
+    reg init_done_r;
+    always @(posedge ddr_clk) begin
+        if (dis_wirq) init_done_r <= 1'b1;
+        else          init_done_r <= init_done_r;
+    end
+    assign init_done = init_done_r;
+
+endmodule
+
+//=============================================================================
+//=============================================================================
+// module cam_frm_wr  --  摄像头整帧 1:1 写发生器（版本二 2026-10-30 第三版）
+//
+//   ★ 本次改动（2026-10-30 晚）：写侧从"148.5MHz + phase 拉伸"改回
+//     "摄像头自己的时钟 + 1:1 写"。
+//
+//   旧实现（本文件上一版）的两个毛病，正是上板花屏/错位/斜纹的根因：
+//     (1) 整个模块跑在 pixclk_in(148.5MHz) 域，靠行缓存的 line_new 跨域触发。
+//         摄像头行事件跨到 148.5MHz 域采样，会漏采/多采一行；wr_buf 的行指针
+//         与摄像头行号就会慢慢错开 -> 斜纹、逐帧滚动。
+//     (2) 写侧用 ltog 做 phase 拉伸（每两行中的一行写两遍，720 -> 1080 的
+//         1.5 倍纵向放大）。写指针与源行不再是 1:1，再叠加 (1) 的漂移
+//         -> 行错位、花屏。
+//
+//   现在（回到 1944 黄金版已验证的结构）：
+//       · 跑 cam_pclk_16bit —— 摄像头自己的像素时钟（来自 cmos_8_16bit）
+//       · 1:1 写：de_in 有效 1 拍 = 写 1 个像素；摄像头 1 行 = 帧缓存 1 行
+//       · 所有拉伸（水平 640->960、垂直 480->1080）全部移到【读侧】
+//         cam_line_rd，用 Bresenham 按地址算
+//
+//   本模块剩下四件事：
+//       1) 像素直通（可选测试图案）
+//       2) 行内截断到 H_NUM 个像素
+//          为什么必须截断：wr_buf 的 write_en 用 x_cnt[0] 把相邻两像素打包成
+//          一个 32bit 字，读侧每次固定搬 RD_LINE_NUM 拍。每行像素数必须一样多，
+//          多了少了都会让写指针相对读指针漂移 -> 整行累积错位。
+//       3) 帧末发 o_fsync（只在 VSYNC 上升沿）
+//       4) 行数诊断（帧末锁存，给"实测摄像头每帧到底多少行"用）
+//
+//   ⚠️ 铁律：o_fsync 绝不能在一帧中间发（framebuf 会中途复位 -> 花屏）。
+//      VSYNC 上升沿天然在一帧结束之后（垂直消隐开始），所以只认它的上升沿。
+//   ⚠️ 铁律：每行 o_en 必须连续高 >= H_NUM-20 拍、行间低 >= 1 拍。
+//      这里 o_en 连续高恰好 H_NUM 拍（640），行间由摄像头 HREF 的低电平拉开。
+//=============================================================================
+module cam_frm_wr #(
+    parameter integer H_NUM = 640,      // 每行写入像素数（= 摄像头真实行宽）
+    parameter integer V_NUM = 480       // 每帧行数（仅注释/诊断，不参与地址）
+)(
+    input  wire        clk,          // cam_pclk_16bit（摄像头像素时钟）
+    input  wire        rst_n,
+    input  wire        vs_in,        // 摄像头 VSYNC（高有效）
+    input  wire        pat_en,       // 1 = 输出测试图案（隔离帧缓存通路用）
+    input  wire        de_in,        // 摄像头行有效：1 像素/拍
+    input  wire [15:0] pix_in,       // RGB565
+    output reg         o_fsync,      // 帧边界 1 拍脉冲
+    output reg         o_en,         // 写使能（每行连续 H_NUM 拍）
+    output reg  [15:0] o_px,
+    output reg  [11:0] o_rows,       // 本帧已写行数（实时）
+    output reg  [11:0] o_lines       // 上一帧实际行数（帧末锁存，诊断用）
+);
+
+    //--------------------------------------------------------------------
+    // VSYNC 打三拍后取上升沿（本时钟域同步 + 边沿检测）
+    //--------------------------------------------------------------------
+    reg [2:0] vs_s;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) vs_s <= 3'd0;
+        else        vs_s <= {vs_s[1:0], vs_in};
+    end
+    wire vs_rise = (vs_s[2:1] == 2'b01);
+
+    //--------------------------------------------------------------------
+    // 行内像素计数 / 帧内行计数
+    //--------------------------------------------------------------------
+    reg [11:0] px_cnt;           // 本行已通过 de 的像素数
+    reg [11:0] row_cnt;          // 本帧已开始的行数
+    reg        de_d;
+
+    // 测试图案：第 100..103 列竖线 + 每 128 行画 4 行横线，任何错位一眼可见
+    wire [15:0] pat_px = (((px_cnt >= 12'd100) && (px_cnt < 12'd104))
+                            ? 16'hFFFF
+                            : ((row_cnt[6:0] < 7'd4) ? 16'hF800 : 16'h001F));
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            px_cnt  <= 12'd0;
+            row_cnt <= 12'd0;
+            de_d    <= 1'b0;
+            o_en    <= 1'b0;
+            o_px    <= 16'd0;
+            o_fsync <= 1'b0;
+            o_rows  <= 12'd0;
+            o_lines <= 12'd0;
+        end else begin
+            o_fsync <= vs_rise;                    // 只认 VSYNC 上升沿
+            de_d    <= de_in;
+
+            // 1:1 直通；行内只放前 H_NUM 个像素
+            o_en <= de_in && (px_cnt < H_NUM);
+            o_px <= pat_en ? pat_px : pix_in;
+
+            // 行内计数：de 一低就归零（wr_buf 内部的 x_cnt 也是靠 wr_en 低电平归零，
+            // 两边同拍动作，packing 的奇偶才对得上）
+            if (!de_in)              px_cnt <= 12'd0;
+            else if (px_cnt < H_NUM) px_cnt <= px_cnt + 12'd1;
+
+            // 行计数：每个 de 上升沿算一行
+            if (de_in && !de_d) begin
+                if (row_cnt != 12'd4095) row_cnt <= row_cnt + 12'd1;
+                o_rows <= row_cnt + 12'd1;
+            end
+
+            // 帧末：锁存上一帧真实行数，计数器归零
+            if (vs_rise) begin
+                o_lines <= row_cnt;
+                o_rows  <= 12'd0;
+                row_cnt <= 12'd0;
+            end
+        end
+    end
+
+endmodule
+
+//=============================================================================
+// module cam_line_rd  --  摄像头帧读取 + 双轴 Bresenham 拉伸（版本二 2026-10-30）
+//
+//   用途：把摄像头帧缓存（SRC_W x SRC_H = 640x480）放大到右半屏
+//         （DST_W x DST_H = 960x1080）。写侧完全 1:1，拉伸全在这里用地址算。
+//
+//   为什么不能用厂商 rd_buf：
+//     它每行都把 DDR 里的"下一行"搬进来，行号只会 +1，没法让同一行显示两遍，
+//     所以做不了纵向放大（480 -> 1080）。纵向放大必须能控制"本显示行取源第
+//     几行"，只能自己维护行指针。
+//
+//   结构（和厂商 rd_buf 一样是"每显示行读一行"，单 bank 行缓存）：
+//     · 行起点（rd_de 且 rd_x==0）用纵向 Bresenham 决定本行取源第几行
+//     · 只有源行号真的前进时才发 DDR 读请求；重复行直接复用行缓存里的数据
+//     · 读回的 256bit 拍按 BEATS 拍写进行缓存（rd_fram_buf，256bit 写 / 32bit 读）
+//     · 右半屏（x=DST_X0..）逐像素输出：水平 Bresenham 决定取源第几列
+//     · 行缓存按"源行号 mod 8"分槽：每槽 64 个 256bit 入口 = 512 个 32bit 字
+//       = 512 个 32bit 字 = 1024 像素容量（640 只用前 320 字），8 槽正好 4096 字
+//
+//   时序预算（关键，别乱动）：
+//     行起点发请求 -> 40 拍 DDR 读（约 100 拍）-> 左半屏 960 拍内肯定读完
+//     -> rd_x=957 开始产生像素
+//     -> 流水 3 级：行缓存 1 拍读延迟 + 半字选择打 2 拍 + 输出寄存器 1 拍
+//        （⚠️ 半字选择必须和读延迟同级对齐，否则每个 32bit 字会取错半个像素：
+//          仿真里表现为每组 3 像素变成 [a,b,a] 而不是 [a,a,b]，画面是细碎色边）
+//     -> vout_de/vout_data 都晚 3 拍，正好落在 x=960..1919
+//
+//   像素位序（与厂商 rd_buf.v 的 PIX_WIDTH==16 分支完全一致）：
+//     32bit 字 a 里，源像素 2a 在 [31:16]、源像素 2a+1 在 [15:0]。
+//     ⚠️ 这个位序是从"已在板上验证过的显示通路"照抄来的，不能按写侧的
+//        {wr_data, wr_data_1d} 去推——中间隔了 wr_fram_buf/rd_fram_buf
+//        两次宽窄转换，推错的代价是一整次编译。
+//=============================================================================
+module cam_line_rd #(
+    parameter integer SRC_W  = 640,     // 源行宽（= 写侧 cam_frm_wr 的 H_NUM）
+    parameter integer SRC_H  = 480,     // 源行数（= 摄像头每帧真实行数）
+    parameter integer DST_X0 = 960,     // 右半屏起点
+    parameter integer DST_W  = 960,     // 右半屏宽
+    parameter integer DST_H  = 1080     // 屏幕高
+)(
+    input  wire         vout_clk,
+    input  wire         ddr_clk,
+    input  wire         rst_n,
+    input  wire         rd_fsync,      // 帧头（vout_clk 域）
+    input  wire         rd_de,         // 显示 DE（与 rd_x 对齐，vout_clk 域）
+    input  wire [11:0]  rd_x,          // 显示 x 坐标（vout_clk 域）
+    input  wire         frame_bank,    // 读哪一块 DDR3 帧缓存（ddr_clk 域稳定电平）
+    input  wire [27:0]  base_addr,     // 摄像头帧缓存基地址（DDR3 32bit 字地址）
+    output reg          ddr_rreq,      // 1 拍读请求
+    output wire [27:0]  ddr_raddr,
+    output wire [31:0]  ddr_rd_len,
+    input  wire         ddr_rdone,     // 本次行读事务结束
+    input  wire         ddr_rdata_en,  // 每个 256bit 拍
+    input  wire [255:0] ddr_rdata,
+    output wire [15:0]  vout_data,
+    output wire         vout_de
+);
+
+    localparam integer BEATS  = SRC_W*16/256;       // 每行 256bit 拍数（640 -> 40）
+    localparam integer STRIDE = SRC_W/2;            // 每行 32bit 字数（必须等于 wr_buf 的 DDR_ADDR_OFFSET）
+    localparam [11:0]  SW     = SRC_W;              // 源行宽（12bit 化，便于比较）
+    localparam [11:0]  GEN0   = DST_X0 - 3;         // 957：提前 3 拍（读延迟 1 + 两级寄存）
+    localparam [11:0]  GEN1   = DST_X0 + DST_W - 1; // 1919：多跑 3 拍把流水排空
+                                                    //（多出的 3 个像素不输出，见 vout_de）
+    localparam [11:0]  X0     = DST_X0;             // 右半屏第一列
+    localparam [11:0]  X1     = DST_X0 + DST_W - 1; // 右半屏最后一列
+    localparam [31:0]  RD_LEN = BEATS;
+
+    //=====================================================================
+    // 一、vout_clk 域：帧/行状态、纵向 Bresenham、水平 Bresenham、像素输出
+    //=====================================================================
+    reg  [11:0] buf_sy;        // 行缓存里现在是源第几行（12'hFFF = 还没有）
+    reg  [11:0] sy;            // 本显示行取源第几行
+    reg  [12:0] acc_v;         // 纵向 Bresenham 累加器
+    reg         first;         // 帧内第一行（不推进累加器）
+    reg         req_tgl;       // 读请求翻转（跨到 ddr_clk 域）
+    reg  [11:0] req_row;       // 请求的源行号
+
+    reg  [11:0] sx;            // 水平：当前取源第几列
+    reg  [12:0] acc_h;         // 水平 Bresenham 累加器
+    reg  [11:0] rd_word;       // 行缓存读地址（32bit 字）
+    reg  [11:0] sx_d1, sx_d2;  // 源列号打两拍（必须和"读延迟 1 拍 + 输出寄存 1 拍"对齐）
+    reg  [15:0] pix_r;         // 输出像素
+
+    wire line_start = rd_de && (rd_x == 12'd0);
+    wire gen        = rd_de && (rd_x >= GEN0) && (rd_x <= GEN1);
+
+    // 纵向：acc_v + SRC_H 跨过 DST_H 就换下一源行，否则本行重复上一源行
+    //   （480 -> 1080 = 每 9 个显示行只前进 4 个源行）
+    wire [12:0] acc_v_n  = acc_v + SRC_H;
+    wire        adv_v    = (acc_v_n >= DST_H);
+    wire [12:0] acc_v_nx = adv_v ? (acc_v_n - DST_H) : acc_v_n;
+    wire [11:0] tgt_sy   = (first || !adv_v) ? sy : (sy + 12'd1);
+    wire [12:0] tgt_acc  = first ? 13'd0 : acc_v_nx;
+
+    // 水平：acc_h + SRC_W 跨过 DST_W 就在下一像素用源下一列
+    //   （640 -> 960 = 每 3 个显示像素取 2 个源像素，第 1 个重复一次）
+    wire [12:0] acc_h_n  = acc_h + SRC_W;
+    wire        adv_h    = (acc_h_n >= DST_W);
+    wire [11:0] slot_word = {buf_sy[2:0], 9'd0};            // 行槽基址（32bit 字）
+    wire [11:0] word_addr = slot_word + {2'b0, sx[10:1]};   // 槽基址 + 列字偏移
+
+    wire [31:0] lb_word;                                    // 行缓存读数据
+
+    always @(posedge vout_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            buf_sy  <= 12'hFFF;
+            sy      <= 12'd0;
+            acc_v   <= 13'd0;
+            first   <= 1'b1;
+            req_tgl <= 1'b0;
+            req_row <= 12'd0;
+            sx      <= 12'd0;
+            acc_h   <= 13'd0;
+            rd_word <= 12'd0;
+            sx_d1   <= 12'd0;
+            sx_d2   <= 12'd0;
+            pix_r   <= 16'd0;
+        end else begin
+            //---------------- 像素流水（★ 每一拍都要移，不能只在 gen 里移） ----------------
+            //   gen 比输出窗口早 3 拍（行缓存数据要到"最后一拍 gen + 2"才全部出来）。
+            //   如果只在 gen 里更新 pix_r，gen 一低 pix_r 就冻住，每行最后 1 个像素
+            //   会重复上一个像素（仿真实测：本该 639 却出 638）。
+            pix_r <= sx_d2[0] ? lb_word[15:0] : lb_word[31:16];
+
+            //---------------- 帧头：纵向状态归零，强行重取第 0 行 ----------------
+            if (rd_fsync) begin
+                buf_sy <= 12'hFFF;
+                sy     <= 12'd0;
+                acc_v  <= 13'd0;
+                first  <= 1'b1;
+            end
+
+            //---------------- 行起点：定本行源行号 + 水平状态归零 + 需要时发读请求 ----------------
+            //   ⚠️ 水平状态必须在这里清零，不能写成 "!gen 就清零"：
+            //      那样 gen 一落，sx_d2 会在最后几个像素的流水里被改成 0，
+            //      最后一个像素的半字选择就会取错（仿真里正好差 1 个像素）。
+            if (line_start) begin
+                sy    <= tgt_sy;
+                acc_v <= tgt_acc;
+                first <= 1'b0;
+                sx    <= 12'd0;
+                acc_h <= 13'd0;
+                if (tgt_sy != buf_sy) begin
+                    req_row <= tgt_sy;
+                    req_tgl <= ~req_tgl;
+                    buf_sy  <= tgt_sy;
+                end
+            end
+
+            //---------------- 右半屏：地址/计数推进（rd_x=957 起，比窗口早 3 拍） ----------------
+            if (gen) begin
+                rd_word <= word_addr;
+                sx_d1   <= sx;
+                sx_d2   <= sx_d1;
+                // 最后一列钳住：gen 比窗口多跑 3 拍（为了把流水排空），
+                // 不钳的话会把 sx 推到 SRC_W（越界），最后几个像素会取错半字。
+                if (sx < SW - 12'd1) begin
+                    if (adv_h) begin
+                        sx    <= sx + 12'd1;
+                        acc_h <= acc_h_n - DST_W;
+                    end else begin
+                        acc_h <= acc_h_n;
+                    end
+                end
+            end
+        end
+    end
+
+    //=====================================================================
+    // 二、ddr_clk 域：请求跨域 + 发读事务 + 行缓存填充
+    //=====================================================================
+    reg         req_s, req_s1;
+    reg         pend;              // 有一笔请求还没真正发出
+    reg  [11:0] pend_row;
+    reg         busy;              // 本次行读事务进行中
+    reg  [11:0] row_d;             // 正在读的源行号
+    reg  [8:0]  fill_addr;         // 行缓存写地址（256bit 入口）
+
+    wire req_pulse = (req_s ^ req_s1);
+
+    always @(posedge ddr_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            req_s  <= 1'b0;
+            req_s1 <= 1'b0;
+        end else begin
+            req_s  <= req_tgl;
+            req_s1 <= req_s;
+        end
+    end
+
+    always @(posedge ddr_clk or negedge rst_n) begin
+        if (!rst_n) begin
+            ddr_rreq  <= 1'b0;
+            pend      <= 1'b0;
+            pend_row  <= 12'd0;
+            busy      <= 1'b0;
+            row_d     <= 12'd0;
+            fill_addr <= 9'd0;
+        end else begin
+            ddr_rreq <= 1'b0;      // 1 拍请求，和厂商 rd_buf 一样靠仲裁器的 rpend 挂起
+
+            if (pend && !busy) begin
+                busy      <= 1'b1;
+                ddr_rreq  <= 1'b1;
+                row_d     <= pend_row;
+                fill_addr <= {pend_row[2:0], 6'd0};    // 本行的 256bit 槽基址
+                pend      <= 1'b0;
+            end else if (ddr_rdone) begin
+                busy <= 1'b0;
+            end
+
+            // 新请求（放在后面：同一拍既有待发又有新请求时，新请求不会被吃掉）
+            if (req_pulse) begin
+                pend     <= 1'b1;
+                pend_row <= req_row;
+            end
+
+            if (ddr_rdata_en) fill_addr <= fill_addr + 9'd1;
+        end
+    end
+
+    // DDR3 行地址 = 基址 + 帧 bank 偏移 + 源行号*每行字数
+    //   bank 偏移 = 2^21 字（wr_buf 里帧位在 LINE_ADDR_WIDTH=21 位上）
+    wire [27:0] row_off  = row_d * STRIDE;
+    wire [27:0] bank_off = {1'b0, frame_bank, 21'd0};
+    assign ddr_raddr  = base_addr + bank_off + row_off;
+    assign ddr_rd_len = RD_LEN;
+
+    //=====================================================================
+    // 三、行缓存（256bit 写 / 32bit 读，双时钟）
+    //=====================================================================
+    rd_fram_buf u_row_buf (
+        .wr_data  (ddr_rdata    ),
+        .wr_addr  (fill_addr    ),
+        .wr_en    (ddr_rdata_en ),
+        .wr_clk   (ddr_clk      ),
+        .wr_rst   (~rst_n       ),
+        .rd_addr  (rd_word      ),
+        .rd_data  (lb_word      ),
+        .rd_clk   (vout_clk     ),
+        .rd_rst   (~rst_n       )
+    );
+
+    assign vout_data = pix_r;
+    // de 直接由【当前】rd_x/rd_de 判定：流水已把 pix_r 对齐到"时钟 = 显示 x"，
+    // 所以这里不需要再延时链（用延时链会在行尾多出 3 拍，落进消隐区还得再门控）。
+    assign vout_de   = rd_de && (rd_x >= X0) && (rd_x <= X1);
+
+endmodule
